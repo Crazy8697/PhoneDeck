@@ -18,7 +18,7 @@ import sys
 import time
 
 from PySide6.QtCore import Qt, QTimer, QThread, Signal, QSettings, QEvent
-from PySide6.QtGui import QFont, QColor
+from PySide6.QtGui import QFont, QColor, QCursor
 from PySide6.QtWidgets import (
     QApplication, QWidget, QMainWindow, QHBoxLayout, QVBoxLayout, QLineEdit,
     QListWidget, QListWidgetItem, QPushButton, QLabel, QFrame, QMenu,
@@ -302,7 +302,7 @@ class ScrcpyEmbed(QWidget):
         self.proc = subprocess.Popen(
             [SCRCPY, "-s", self.target,
              f"--new-display={DISPLAY_RES}",
-             "--keyboard=uhid", "--mouse=sdk",
+             "--keyboard=disabled", "--mouse=sdk",
              "--window-borderless", f"--window-title={EMBED_TITLE}",
              "--no-audio"],
             stdout=self._log, stderr=subprocess.STDOUT,
@@ -321,14 +321,9 @@ class ScrcpyEmbed(QWidget):
         style = win32gui.GetWindowLong(hwnd, win32con.GWL_STYLE)
         style = (style & ~win32con.WS_POPUP & ~win32con.WS_CAPTION
                  & ~win32con.WS_THICKFRAME) | win32con.WS_CHILD
-        style |= win32con.WS_TABSTOP           # allow keyboard focus
         win32gui.SetWindowLong(hwnd, win32con.GWL_STYLE, style)
         win32gui.SetParent(hwnd, int(self.winId()))
         self._fit()
-        try:
-            win32gui.SetFocus(hwnd)             # hand scrcpy the keyboard
-        except Exception:
-            pass
 
     def _detect_display(self):
         self._disp_tries += 1
@@ -382,8 +377,9 @@ class PhoneDeck(QMainWindow):
         self.resize(1180, 820)
         self.target = None
         self.apps = []
-        self.kb = KeyBridge()   # adb keyboard fallback (used only if the
-                                # embedded display doesn't hold Windows focus)
+        self.kb = KeyBridge()   # forwards keystrokes to the virtual display
+                                # (adb `input -d <id>`) — the only path that
+                                # targets the external display, not the phone
 
         root = QWidget()
         self.setCentralWidget(root)
@@ -460,11 +456,19 @@ class PhoneDeck(QMainWindow):
         Qt.Key_Up: 19, Qt.Key_Down: 20, Qt.Key_Home: 122, Qt.Key_End: 123,
     }
 
+    def _mouse_over_display(self):
+        gp = QCursor.pos()
+        tl = self.embed.mapToGlobal(self.embed.rect().topLeft())
+        return (tl.x() <= gp.x() <= tl.x() + self.embed.width() and
+                tl.y() <= gp.y() <= tl.y() + self.embed.height())
+
     def eventFilter(self, obj, event):
         if event.type() == QEvent.KeyPress:
-            if self.search.hasFocus():
-                return False                     # let app-search typing work
             if not (self.target and self.embed.display_id is not None):
+                return False
+            # keys go to the phone only while the cursor is over the display;
+            # over the sidebar they fall through to the search box
+            if not self._mouse_over_display():
                 return False
             k = event.key()
             if k in self._SPECIAL:
