@@ -89,7 +89,6 @@ SETTING_DEFAULTS = {
     "dpi": 180,                 # virtual display density
     "scroll_dist": 260,         # px of swipe per wheel tick
     "scroll_natural": True,     # wheel up scrolls content up
-    "type_delay": 250,          # ms pause before typed text is sent as one batch
 }
 
 
@@ -177,6 +176,25 @@ def save_favorites(favs):
     try:
         with open(FAV_FILE, "w", encoding="utf-8") as f:
             json.dump(sorted(favs), f, indent=2)
+    except Exception:
+        pass
+
+
+def force_focus(hwnd):
+    """Give Windows keyboard focus to a window in another process (the embedded
+    scrcpy child), via AttachThreadInput — so scrcpy captures keystrokes."""
+    if not hwnd:
+        return
+    u = ctypes.windll.user32
+    try:
+        tgt = u.GetWindowThreadProcessId(hwnd, None)
+        cur = ctypes.windll.kernel32.GetCurrentThreadId()
+        attached = tgt and tgt != cur
+        if attached:
+            u.AttachThreadInput(cur, tgt, True)
+        u.SetFocus(hwnd)
+        if attached:
+            u.AttachThreadInput(cur, tgt, False)
     except Exception:
         pass
 
@@ -436,9 +454,11 @@ class WheelBridge:
         try:
             if (nCode == 0 and wParam == _WM_LBUTTONDOWN
                     and self.main.isActiveWindow()):
-                # keyboard follows the last click: search box -> search,
-                # everything else (display, apps, nav) -> phone
-                self.main.kb_to_phone = not self.main._search_hit()
+                # click the display -> hand keyboard focus to scrcpy (smooth
+                # typing straight to the phone). click the search box -> leave
+                # Qt focus alone so app-search typing works.
+                if not self.main._search_hit():
+                    QTimer.singleShot(0, lambda: force_focus(self.main.embed.hwnd))
             if (nCode == 0 and wParam == _WM_MOUSEWHEEL
                     and self.kb.did is not None and self._hot()):
                 now = time.monotonic()
@@ -508,7 +528,7 @@ class ScrcpyEmbed(QWidget):
         self.proc = subprocess.Popen(
             [SCRCPY, "-s", self.target,
              f"--new-display={res}",
-             "--keyboard=disabled", "--mouse=sdk",
+             "--keyboard=sdk", "--mouse=sdk",
              "--window-borderless", f"--window-title={EMBED_TITLE}",
              "--no-audio"],
             stdout=self._log, stderr=subprocess.STDOUT,
@@ -597,18 +617,8 @@ class PhoneDeck(QMainWindow):
         self.resize(1180, 820)
         self.target = None
         self.apps = []
-        self.kb = KeyBridge()   # forwards keystrokes to the virtual display
-                                # (adb `input -d <id>`) — the only path that
-                                # targets the external display, not the phone
-        self.kb_to_phone = True  # keyboard target; flipped by clicks (WheelBridge)
+        self.kb = KeyBridge()   # adb bridge, now only for wheel-scroll swipes
         self.wheel = WheelBridge(self.kb, self)
-        # coalesce a word's characters into one `input text` call (fewer, faster
-        # commands -> no per-key backlog that lands text in the wrong field)
-        self._kbuf = []
-        self._ktimer = QTimer(self)
-        self._ktimer.setSingleShot(True)
-        self._ktimer.setInterval(cfg_get("type_delay", int))   # user-tunable
-        self._ktimer.timeout.connect(self._flush_keys)
 
         # menu bar
         fm = self.menuBar().addMenu("File")
@@ -665,18 +675,10 @@ class PhoneDeck(QMainWindow):
 
         self._apply_theme()
         self._restore_geometry()
-        QApplication.instance().installEventFilter(self)
         QTimer.singleShot(200, self.connect_phone)
 
-    # -- keyboard: forward keystrokes to the phone unless the search box has
-    #    focus (so app-search typing still works) --
-    _SPECIAL = {
-        Qt.Key_Return: 66, Qt.Key_Enter: 66, Qt.Key_Backspace: 67,
-        Qt.Key_Tab: 61, Qt.Key_Delete: 112,
-        Qt.Key_Escape: 111, Qt.Key_Left: 21, Qt.Key_Right: 22,
-        Qt.Key_Up: 19, Qt.Key_Down: 20, Qt.Key_Home: 122, Qt.Key_End: 123,
-    }
-
+    # Typing goes through scrcpy's own keyboard (instant) once the display
+    # holds Windows focus; WheelBridge hands it focus on a display click.
     def _mouse_over_display(self):
         gp = QCursor.pos()
         tl = self.embed.mapToGlobal(self.embed.rect().topLeft())
@@ -694,31 +696,6 @@ class PhoneDeck(QMainWindow):
         # for the global wheel hook: only act when PhoneDeck is active and the
         # cursor is over the display
         return self.isActiveWindow() and self._mouse_over_display()
-
-    def eventFilter(self, obj, event):
-        if event.type() == QEvent.KeyPress:
-            if not (self.target and self.embed.display_id is not None):
-                return False
-            # keyboard follows the last click: search box -> Qt search,
-            # anything else -> the phone
-            if not self.kb_to_phone:
-                return False
-            k = event.key()
-            if k in self._SPECIAL:
-                self._flush_keys()               # keep order before the key
-                self.kb.key(self._SPECIAL[k])
-                return True
-            t = event.text()
-            if t and t.isprintable():
-                self._kbuf.append(t)
-                self._ktimer.start()
-                return True
-        return super().eventFilter(obj, event)
-
-    def _flush_keys(self):
-        if self._kbuf:
-            self.kb.text("".join(self._kbuf))
-            self._kbuf.clear()
 
     # -- window placement (persist; default to the right-most monitor) --
     def _restore_geometry(self):
@@ -836,17 +813,10 @@ class PhoneDeck(QMainWindow):
         scroll.setSuffix(" px"); scroll.setValue(cfg_get("scroll_dist", int))
         natural = QCheckBox("Natural (wheel up scrolls up)")
         natural.setChecked(cfg_get("scroll_natural", bool))
-        tdelay = QSpinBox(); tdelay.setRange(40, 1500); tdelay.setSingleStep(10)
-        tdelay.setSuffix(" ms"); tdelay.setValue(cfg_get("type_delay", int))
         form.addRow("Resolution", res)
         form.addRow("Density (dpi)", dpi)
         form.addRow("Scroll distance", scroll)
         form.addRow("", natural)
-        form.addRow("Typing send delay", tdelay)
-        hint = QLabel("Pause before typed text is sent as one batch. "
-                      "Lower = snappier, more chunks; higher = fewer, bigger chunks.")
-        hint.setStyleSheet("color:#9aa4b2;"); hint.setWordWrap(True)
-        form.addRow(hint)
         note = QLabel("Resolution/density changes reconnect the display.")
         note.setStyleSheet("color:#9aa4b2;")
         form.addRow(note)
@@ -860,8 +830,6 @@ class PhoneDeck(QMainWindow):
             c.setValue("dpi", dpi.value())
             c.setValue("scroll_dist", scroll.value())
             c.setValue("scroll_natural", natural.isChecked())
-            c.setValue("type_delay", tdelay.value())
-            self._ktimer.setInterval(tdelay.value())   # applies live, no restart
             if self.target and (res.currentText(), dpi.value()) != old:
                 self.embed.start(self.target)   # restart display at new size
 
