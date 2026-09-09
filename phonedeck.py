@@ -68,8 +68,6 @@ def data_dir():
 SCRCPY_DIR = _find_scrcpy_dir()
 ADB = os.path.join(SCRCPY_DIR, "adb.exe")
 SCRCPY = os.path.join(SCRCPY_DIR, "scrcpy.exe")
-SERIAL = "3C210DLJG002RN"          # Pixel 8 Pro USB serial
-PHONE_IP = "10.42.69.170"          # DHCP-reserved; used for the 5555 fallback
 EMBED_TITLE = "PhoneDeckDisplay"   # unique scrcpy window title we reparent
 ICON_PATH = _resource("phonedeck.ico")
 SCRCPY_LOG = os.path.join(data_dir(), "scrcpy.log")
@@ -116,36 +114,47 @@ def adb(target, *args, timeout=20):
     return run([ADB, "-s", target, *args], timeout=timeout)
 
 
-def resolve_target():
-    """Find the phone: USB serial first, then wireless debugging via mDNS,
-    then the classic 5555. Returns an adb target string or None."""
-    run([ADB, "start-server"], timeout=15)
+def _connected_devices():
+    """(usb_serials, wireless_targets) currently in `adb devices`."""
+    usb, wl = [], []
     rc, out = run([ADB, "devices"])
     for line in out.splitlines():
-        if line.startswith(SERIAL) and "device" in line:
-            return SERIAL
-    # already-connected wireless device?
-    for line in out.splitlines():
-        m = re.match(r"^(\d{1,3}(?:\.\d{1,3}){3}:\d+)\s+device", line)
-        if m:
-            return m.group(1)
-    # discover wireless debugging (random TLS port)
+        m = re.match(r"^(\S+)\s+device$", line)
+        if m and m.group(1) != "List":
+            t = m.group(1)
+            (wl if re.match(r"\d+\.\d+\.\d+\.\d+:", t) else usb).append(t)
+    return usb, wl
+
+
+def resolve_target(prefer=None):
+    """Find a device to connect to. Order: the preferred (last good) device,
+    then any connected USB device, then any connected wireless device, then
+    discover any wireless-debugging device via mDNS. Returns a target or None.
+    Device-agnostic — not tied to a specific serial."""
+    run([ADB, "start-server"], timeout=15)
+    # 1) preferred / last-good device
+    if prefer:
+        if re.match(r"\d+\.\d+\.\d+\.\d+:", prefer):
+            run([ADB, "connect", prefer], timeout=10)
+        usb, wl = _connected_devices()
+        if prefer in usb or prefer in wl:
+            return prefer
+    # 2) any already-connected device (USB first, then wireless)
+    usb, wl = _connected_devices()
+    if usb:
+        return usb[0]
+    if wl:
+        return wl[0]
+    # 3) discover any wireless-debugging device
     run([ADB, "mdns", "check"], timeout=10)
     for _ in range(10):
         rc, out = run([ADB, "mdns", "services"], timeout=10)
         for line in out.splitlines():
-            if SERIAL in line and "_adb-tls-connect" in line:
+            if "_adb-tls-connect" in line:
                 m = re.search(r"(\d{1,3}(?:\.\d{1,3}){3}:\d+)", line)
-                if m:
-                    tgt = m.group(1)
-                    rc, o = run([ADB, "connect", tgt], timeout=10)
-                    if "connected" in o:
-                        return tgt
+                if m and "connected" in run([ADB, "connect", m.group(1)])[1]:
+                    return m.group(1)
         time.sleep(2)
-    # last resort
-    rc, out = run([ADB, "connect", f"{PHONE_IP}:5555"], timeout=10)
-    if "connected" in out:
-        return f"{PHONE_IP}:5555"
     return None
 
 
@@ -260,8 +269,12 @@ def list_apps(target):
 class ConnectWorker(QThread):
     done = Signal(object)   # target or None
 
+    def __init__(self, prefer=None):
+        super().__init__()
+        self.prefer = prefer
+
     def run(self):
-        self.done.emit(resolve_target())
+        self.done.emit(resolve_target(self.prefer))
 
 
 class AppsWorker(QThread):
@@ -716,21 +729,16 @@ class PhoneDeck(QMainWindow):
 
     # -- connection --
     def connect_phone(self):
-        # auto-discover (USB → wireless), used on startup
+        # prefer the last good device, else auto-discover any device
+        last = cfg().value("last_target")
         self.status.showMessage("Connecting…")
-        self._cw = ConnectWorker()
+        self._cw = ConnectWorker(last)
         self._cw.done.connect(self._connected)
         self._cw.start()
 
     def reconnect(self):
-        # reconnect to the last good device if we have one, else auto-discover
-        last = QSettings("PhoneDeck", "PhoneDeck").value("last_target")
-        if last:
-            self.status.showMessage(f"Reconnecting  ({last})…")
-            run([ADB, "connect", last], timeout=10)
-            self._connected(last)
-        else:
-            self.connect_phone()
+        # same as startup: prefer last good device, else discover
+        self.connect_phone()
 
     def connect_to(self, target):
         # connect to a specific device chosen from Device search
@@ -808,7 +816,9 @@ class PhoneDeck(QMainWindow):
     def _connected(self, target):
         self.target = target
         if not target:
-            self.status.showMessage("Phone not found — USB or Wireless debugging?")
+            self.status.showMessage("No device found — pick one, or plug in / "
+                                    "enable Wireless debugging then Refresh")
+            QTimer.singleShot(300, self.device_search)   # first-run / no device
             return
         QSettings("PhoneDeck", "PhoneDeck").setValue("last_target", target)
         self.status.showMessage(f"Connected  ({target})")
