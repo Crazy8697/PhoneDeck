@@ -89,6 +89,7 @@ SETTING_DEFAULTS = {
     "dpi": 180,                 # virtual display density
     "scroll_dist": 260,         # px of swipe per wheel tick
     "scroll_natural": True,     # wheel up scrolls content up
+    "type_delay": 250,          # ms pause before typed text is sent as one batch
 }
 
 
@@ -362,7 +363,8 @@ class KeyBridge:
         self._enqueue(f"input -d {self.did} keyevent {code}")
 
     def text(self, s):
-        esc = s.replace("'", "'\\''")            # safe inside single quotes
+        # whole phrase in one command; `input text` wants spaces as %s
+        esc = s.replace("'", "'\\''").replace(" ", "%s")
         self._enqueue(f"input -d {self.did} text '{esc}'")
 
     def swipe(self, x1, y1, x2, y2, ms=60):
@@ -605,7 +607,7 @@ class PhoneDeck(QMainWindow):
         self._kbuf = []
         self._ktimer = QTimer(self)
         self._ktimer.setSingleShot(True)
-        self._ktimer.setInterval(40)
+        self._ktimer.setInterval(cfg_get("type_delay", int))   # user-tunable
         self._ktimer.timeout.connect(self._flush_keys)
 
         # menu bar
@@ -670,7 +672,7 @@ class PhoneDeck(QMainWindow):
     #    focus (so app-search typing still works) --
     _SPECIAL = {
         Qt.Key_Return: 66, Qt.Key_Enter: 66, Qt.Key_Backspace: 67,
-        Qt.Key_Tab: 61, Qt.Key_Space: 62, Qt.Key_Delete: 112,
+        Qt.Key_Tab: 61, Qt.Key_Delete: 112,
         Qt.Key_Escape: 111, Qt.Key_Left: 21, Qt.Key_Right: 22,
         Qt.Key_Up: 19, Qt.Key_Down: 20, Qt.Key_Home: 122, Qt.Key_End: 123,
     }
@@ -834,10 +836,17 @@ class PhoneDeck(QMainWindow):
         scroll.setSuffix(" px"); scroll.setValue(cfg_get("scroll_dist", int))
         natural = QCheckBox("Natural (wheel up scrolls up)")
         natural.setChecked(cfg_get("scroll_natural", bool))
+        tdelay = QSpinBox(); tdelay.setRange(40, 1500); tdelay.setSingleStep(10)
+        tdelay.setSuffix(" ms"); tdelay.setValue(cfg_get("type_delay", int))
         form.addRow("Resolution", res)
         form.addRow("Density (dpi)", dpi)
         form.addRow("Scroll distance", scroll)
         form.addRow("", natural)
+        form.addRow("Typing send delay", tdelay)
+        hint = QLabel("Pause before typed text is sent as one batch. "
+                      "Lower = snappier, more chunks; higher = fewer, bigger chunks.")
+        hint.setStyleSheet("color:#9aa4b2;"); hint.setWordWrap(True)
+        form.addRow(hint)
         note = QLabel("Resolution/density changes reconnect the display.")
         note.setStyleSheet("color:#9aa4b2;")
         form.addRow(note)
@@ -851,6 +860,8 @@ class PhoneDeck(QMainWindow):
             c.setValue("dpi", dpi.value())
             c.setValue("scroll_dist", scroll.value())
             c.setValue("scroll_natural", natural.isChecked())
+            c.setValue("type_delay", tdelay.value())
+            self._ktimer.setInterval(tdelay.value())   # applies live, no restart
             if self.target and (res.currentText(), dpi.value()) != old:
                 self.embed.start(self.target)   # restart display at new size
 
