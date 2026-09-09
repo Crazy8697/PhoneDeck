@@ -32,19 +32,51 @@ import win32gui
 import win32con
 
 # ---- paths / device -------------------------------------------------------
-SCRCPY_DIR = r"C:\Program Files\scrcpy-win64-v4.1"
-ADB = SCRCPY_DIR + r"\adb.exe"
-SCRCPY = SCRCPY_DIR + r"\scrcpy.exe"
+def _app_dir():
+    """Directory of the running app (the exe when frozen, else this script)."""
+    if getattr(sys, "frozen", False):
+        return os.path.dirname(sys.executable)
+    return os.path.dirname(os.path.abspath(__file__))
+
+
+def _resource(name):
+    """A bundled resource (PyInstaller unpacks data to sys._MEIPASS)."""
+    base = getattr(sys, "_MEIPASS", _app_dir())
+    return os.path.join(base, name)
+
+
+def _find_scrcpy_dir():
+    for c in (os.path.join(_app_dir(), "scrcpy"),
+              os.path.join(_app_dir(), "scrcpy-win64-v4.1"),
+              r"C:\Program Files\scrcpy-win64-v4.1"):
+        if os.path.exists(os.path.join(c, "scrcpy.exe")):
+            return c
+    return r"C:\Program Files\scrcpy-win64-v4.1"
+
+
+def data_dir():
+    """Per-user writable dir for favorites and logs."""
+    d = os.path.join(os.environ.get("APPDATA", os.path.expanduser("~")),
+                     "PhoneDeck")
+    try:
+        os.makedirs(d, exist_ok=True)
+    except Exception:
+        pass
+    return d
+
+
+SCRCPY_DIR = _find_scrcpy_dir()
+ADB = os.path.join(SCRCPY_DIR, "adb.exe")
+SCRCPY = os.path.join(SCRCPY_DIR, "scrcpy.exe")
 SERIAL = "3C210DLJG002RN"          # Pixel 8 Pro USB serial
 PHONE_IP = "10.42.69.170"          # DHCP-reserved; used for the 5555 fallback
 EMBED_TITLE = "PhoneDeckDisplay"   # unique scrcpy window title we reparent
-ICON_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)),
-                         "phonedeck.ico")
+ICON_PATH = _resource("phonedeck.ico")
+SCRCPY_LOG = os.path.join(data_dir(), "scrcpy.log")
 DISPLAY_RES = "1600x900/240"       # virtual external display size/density
 
 NAV_KEYS = {"Back": 4, "Home": 3, "Recents": 187}
-FAV_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)),
-                        "favorites.json")
+FAV_FILE = os.path.join(data_dir(), "favorites.json")
 
 _SCRCPY_VDISP_RE = re.compile(
     r"displayId=(\d+), uniqueId=.virtual:com\.android\.shell,2000,scrcpy,")
@@ -443,8 +475,7 @@ class ScrcpyEmbed(QWidget):
         # scrcpy sometimes aborts with "Server connection failed" if the prior
         # instance's phone-side server is still clearing — retried by _detect.
         self._start_tries += 1
-        self._log = open(r"C:\Users\Adam\PhoneDeck\scrcpy.log", "w",
-                         encoding="utf-8", errors="replace")
+        self._log = open(SCRCPY_LOG, "w", encoding="utf-8", errors="replace")
         res = f"{cfg_get('resolution')}/{cfg_get('dpi', int)}"
         self.proc = subprocess.Popen(
             [SCRCPY, "-s", self.target,
