@@ -246,6 +246,33 @@ class AppsWorker(QThread):
             self.done.emit([])
 
 
+class PushWorker(QThread):
+    """Push dropped files to the phone's Pictures/PhoneDeck folder and media-scan
+    each so they show up in Kik's (and any app's) image picker."""
+    done = Signal(int)          # number pushed
+    DEST = "/sdcard/Pictures/PhoneDeck"
+
+    def __init__(self, target, files):
+        super().__init__()
+        self.target = target
+        self.files = files
+
+    def run(self):
+        run([ADB, "-s", self.target, "shell", "mkdir", "-p", self.DEST])
+        n = 0
+        for f in self.files:
+            name = os.path.basename(f)
+            rc, _ = run([ADB, "-s", self.target, "push", f,
+                         f"{self.DEST}/{name}"], timeout=300)
+            if rc == 0:
+                run([ADB, "-s", self.target, "shell",
+                     "am", "broadcast", "-a",
+                     "android.intent.action.MEDIA_SCANNER_SCAN_FILE",
+                     "-d", f"file://{self.DEST}/{name}"], timeout=20)
+                n += 1
+        self.done.emit(n)
+
+
 # ---- keyboard bridge ------------------------------------------------------
 class KeyBridge:
     """Forwards PC keystrokes to the phone's virtual display over a single
@@ -444,6 +471,12 @@ class ScrcpyEmbed(QWidget):
         win32gui.SetWindowLong(hwnd, win32con.GWL_STYLE, style)
         win32gui.SetParent(hwnd, int(self.winId()))
         self._fit()
+        try:   # drop scrcpy's own file-drop target so drops bubble to Qt
+            ole = ctypes.windll.ole32
+            ole.RevokeDragDrop.argtypes = [ctypes.c_void_p]
+            ole.RevokeDragDrop(hwnd)
+        except Exception:
+            pass
 
     def _detect_display(self):
         self._disp_tries += 1
@@ -495,6 +528,7 @@ class PhoneDeck(QMainWindow):
         super().__init__()
         self.setWindowTitle("PhoneDeck")
         self.setWindowIcon(QIcon(ICON_PATH))
+        self.setAcceptDrops(True)      # drag files in -> push to phone gallery
         self.resize(1180, 820)
         self.target = None
         self.apps = []
@@ -838,6 +872,30 @@ class PhoneDeck(QMainWindow):
             adb(self.target, "shell", "am", "start", "--display", str(did),
                 "-a", "android.intent.action.MAIN",
                 "-c", "android.intent.category.LAUNCHER", pkg)
+
+    # -- drag & drop files -> phone gallery --
+    def dragEnterEvent(self, e):
+        if self.target and e.mimeData().hasUrls():
+            e.acceptProposedAction()
+
+    def dragMoveEvent(self, e):
+        if self.target and e.mimeData().hasUrls():
+            e.acceptProposedAction()
+
+    def dropEvent(self, e):
+        files = [u.toLocalFile() for u in e.mimeData().urls()
+                 if u.isLocalFile() and os.path.isfile(u.toLocalFile())]
+        if not files or not self.target:
+            return
+        e.acceptProposedAction()
+        self.status.showMessage(f"Pushing {len(files)} file(s) to phone…")
+        self._pw = PushWorker(self.target, files)
+        self._pw.done.connect(self._pushed)
+        self._pw.start()
+
+    def _pushed(self, n):
+        self.status.showMessage(
+            f"Pushed {n} file(s) to Pictures/PhoneDeck — pick them in the app")
 
     # -- nav --
     def nav(self, name):
