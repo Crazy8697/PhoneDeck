@@ -532,6 +532,7 @@ class ScrcpyEmbed(QWidget):
             [SCRCPY, "-s", self.target,
              f"--new-display={res}",
              "--keyboard=sdk", "--raw-key-events", "--mouse=sdk",
+             "--display-ime-policy=hide",   # no on-screen keyboard (PC types)
              "--window-borderless", f"--window-title={EMBED_TITLE}",
              "--no-audio"],
             stdout=self._log, stderr=subprocess.STDOUT,
