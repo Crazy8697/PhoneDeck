@@ -230,10 +230,12 @@ class ScrcpyEmbed(QWidget):
         kill_orphan_embeds()   # sweep any leftover embed from a prior crash
         self.target = target
         self.display_id = None
-        # Keyboard must be UHID to reach the virtual display; mouse stays SDK
-        # so the pointer isn't captured/locked to the window (absolute, click
-        # where you point). show_ime_with_hard_keyboard keeps the phone's own
-        # soft keyboard working despite the UHID keyboard being attached.
+        # Both keyboard and mouse are UHID. Keyboard must be UHID to reach the
+        # virtual display, and scrcpy only forwards the UHID keyboard while the
+        # window holds pointer capture — which happens only in UHID mouse mode.
+        # SDK mouse frees the cursor but breaks typing, so UHID it is (release
+        # the captured pointer with the Windows key). show_ime_with_hard_keyboard
+        # keeps the phone's own soft keyboard working despite the UHID keyboard.
         run([ADB, "-s", target, "shell", "settings", "put", "secure",
              "show_ime_with_hard_keyboard", "1"], timeout=10)
         self._ids_before = scrcpy_display_ids(target)
@@ -242,7 +244,7 @@ class ScrcpyEmbed(QWidget):
         self.proc = subprocess.Popen(
             [SCRCPY, "-s", target,
              f"--new-display={DISPLAY_RES}",
-             "--keyboard=uhid", "--mouse=sdk",
+             "--keyboard=uhid", "--mouse=uhid",
              "--window-borderless", f"--window-title={EMBED_TITLE}",
              "--no-audio"],
             stdout=self._log, stderr=subprocess.STDOUT,
