@@ -337,8 +337,15 @@ class KeyBridge:
                 stdin=subprocess.PIPE, stdout=subprocess.DEVNULL,
                 stderr=subprocess.DEVNULL, text=True, encoding="utf-8",
                 creationflags=CREATE_NO_WINDOW)
+            self.warmup()
         except Exception:
             self.proc = None
+
+    def warmup(self):
+        # the first `input` after idle is slow (framework load); prime it so
+        # real keystrokes don't queue behind a cold, slow first command
+        if self.did is not None:
+            self._send(f"input -d {self.did} keyevent 0")
 
     def _send(self, line):
         if self.proc and self.proc.poll() is None:
@@ -433,6 +440,8 @@ class WheelBridge:
                 # keyboard follows the last click: search box -> search,
                 # everything else (display, apps, nav) -> phone
                 self.main.kb_to_phone = not self.main._search_hit()
+                if self.main.kb_to_phone:      # about to type on the phone
+                    self.kb.warmup()           # prime input so 1st key isn't cold
             if (nCode == 0 and wParam == _WM_MOUSEWHEEL
                     and self.kb.did is not None and self._hot()):
                 now = time.monotonic()
@@ -590,6 +599,13 @@ class PhoneDeck(QMainWindow):
                                 # targets the external display, not the phone
         self.kb_to_phone = True  # keyboard target; flipped by clicks (WheelBridge)
         self.wheel = WheelBridge(self.kb, self)
+        # coalesce a word's characters into one `input text` call (fewer, faster
+        # commands -> no per-key backlog that lands text in the wrong field)
+        self._kbuf = []
+        self._ktimer = QTimer(self)
+        self._ktimer.setSingleShot(True)
+        self._ktimer.setInterval(40)
+        self._ktimer.timeout.connect(self._flush_keys)
 
         # menu bar
         fm = self.menuBar().addMenu("File")
@@ -686,13 +702,20 @@ class PhoneDeck(QMainWindow):
                 return False
             k = event.key()
             if k in self._SPECIAL:
+                self._flush_keys()               # keep order before the key
                 self.kb.key(self._SPECIAL[k])
                 return True
             t = event.text()
             if t and t.isprintable():
-                self.kb.text(t)
+                self._kbuf.append(t)
+                self._ktimer.start()
                 return True
         return super().eventFilter(obj, event)
+
+    def _flush_keys(self):
+        if self._kbuf:
+            self.kb.text("".join(self._kbuf))
+            self._kbuf.clear()
 
     # -- window placement (persist; default to the right-most monitor) --
     def _restore_geometry(self):
