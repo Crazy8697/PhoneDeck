@@ -27,7 +27,7 @@ from PySide6.QtWidgets import (
     QApplication, QWidget, QMainWindow, QHBoxLayout, QVBoxLayout, QLineEdit,
     QListWidget, QListWidgetItem, QPushButton, QLabel, QFrame, QMenu,
     QDialog, QComboBox, QSpinBox, QSlider, QCheckBox, QDialogButtonBox,
-    QFormLayout,
+    QFormLayout, QToolButton,
 )
 
 import win32gui
@@ -620,8 +620,16 @@ class PhoneDeck(QMainWindow):
         self.kb = KeyBridge()   # adb bridge, now only for wheel-scroll swipes
         self.wheel = WheelBridge(self.kb, self)
 
-        # menu bar
-        fm = self.menuBar().addMenu("File")
+        # menu bar + sidebar toggle (small button left of "File")
+        mb = self.menuBar()
+        self._side_btn = QToolButton()
+        self._side_btn.setText("☰")
+        self._side_btn.setAutoRaise(True)
+        self._side_btn.setCursor(Qt.PointingHandCursor)
+        self._side_btn.setToolTip("Show/hide app drawer")
+        self._side_btn.clicked.connect(self._toggle_sidebar)
+        mb.setCornerWidget(self._side_btn, Qt.TopLeftCorner)
+        fm = mb.addMenu("File")
         fm.addAction("Refresh apps", self.load_apps)
         fm.addAction("Reconnect", self.reconnect)
         fm.addAction("Device search…", self.device_search)
@@ -635,7 +643,7 @@ class PhoneDeck(QMainWindow):
         body.setContentsMargins(0, 0, 0, 0)
         body.setSpacing(0)
 
-        side = QFrame()
+        self.side = side = QFrame()
         side.setFixedWidth(260)
         side.setStyleSheet("background:#101317;")
         sl = QVBoxLayout(side)
@@ -696,6 +704,10 @@ class PhoneDeck(QMainWindow):
         # for the global wheel hook: only act when PhoneDeck is active and the
         # cursor is over the display
         return self.isActiveWindow() and self._mouse_over_display()
+
+    def _toggle_sidebar(self):
+        self.side.setVisible(not self.side.isVisible())
+        QTimer.singleShot(0, self.embed._fit)   # display fills the freed space
 
     # -- window placement (persist; default to the right-most monitor) --
     def _restore_geometry(self):
