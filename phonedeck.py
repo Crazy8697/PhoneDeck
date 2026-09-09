@@ -17,7 +17,7 @@ import subprocess
 import sys
 import time
 
-from PySide6.QtCore import Qt, QTimer, QThread, Signal
+from PySide6.QtCore import Qt, QTimer, QThread, Signal, QSettings, QEvent
 from PySide6.QtGui import QFont, QColor
 from PySide6.QtWidgets import (
     QApplication, QWidget, QMainWindow, QHBoxLayout, QVBoxLayout, QLineEdit,
@@ -202,6 +202,57 @@ class AppsWorker(QThread):
             self.done.emit([])
 
 
+# ---- keyboard bridge ------------------------------------------------------
+class KeyBridge:
+    """Forwards PC keystrokes to the phone's virtual display over a single
+    persistent `adb shell` (fast + ordered), since scrcpy's own keyboard can't
+    reach the embedded virtual display."""
+
+    def __init__(self):
+        self.proc = None
+        self.did = None
+
+    def start(self, target, did):
+        self.stop()
+        self.did = did
+        try:
+            self.proc = subprocess.Popen(
+                [ADB, "-s", target, "shell"],
+                stdin=subprocess.PIPE, stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL, text=True, encoding="utf-8",
+                creationflags=CREATE_NO_WINDOW)
+        except Exception:
+            self.proc = None
+
+    def _send(self, line):
+        if self.proc and self.proc.poll() is None:
+            try:
+                self.proc.stdin.write(line + "\n")
+                self.proc.stdin.flush()
+            except Exception:
+                pass
+
+    def key(self, code):
+        if self.did is not None:
+            self._send(f"input -d {self.did} keyevent {code}")
+
+    def text(self, ch):
+        if self.did is None:
+            return
+        esc = ch.replace("'", "'\\''")           # safe inside single quotes
+        self._send(f"input -d {self.did} text '{esc}'")
+
+    def stop(self):
+        if self.proc:
+            try:
+                self.proc.stdin.close()
+            except Exception:
+                pass
+            if self.proc.poll() is None:
+                self.proc.terminate()
+        self.proc = None
+
+
 # ---- embedded scrcpy ------------------------------------------------------
 class ScrcpyEmbed(QWidget):
     """Hosts an embedded, borderless scrcpy window that shows a *virtual*
@@ -224,27 +275,34 @@ class ScrcpyEmbed(QWidget):
         self._disp_poll = QTimer(self)
         self._disp_poll.timeout.connect(self._detect_display)
         self._disp_tries = 0
+        self._start_tries = 0
 
     def start(self, target):
         self.stop()
         kill_orphan_embeds()   # sweep any leftover embed from a prior crash
         self.target = target
         self.display_id = None
-        # Both keyboard and mouse are UHID. Keyboard must be UHID to reach the
-        # virtual display, and scrcpy only forwards the UHID keyboard while the
-        # window holds pointer capture — which happens only in UHID mouse mode.
-        # SDK mouse frees the cursor but breaks typing, so UHID it is (release
-        # the captured pointer with the Windows key). show_ime_with_hard_keyboard
-        # keeps the phone's own soft keyboard working despite the UHID keyboard.
+        # scrcpy handles the MOUSE only (sdk = absolute, cursor not captured).
+        # The keyboard is DISABLED in scrcpy — embedding steals the window focus
+        # scrcpy's keyboard needs, so PhoneDeck captures keystrokes itself and
+        # forwards them over adb (KeyBridge). show_ime_with_hard_keyboard keeps
+        # the phone's own soft keyboard behaviour sane.
         run([ADB, "-s", target, "shell", "settings", "put", "secure",
              "show_ime_with_hard_keyboard", "1"], timeout=10)
         self._ids_before = scrcpy_display_ids(target)
+        self._start_tries = 0
+        self._spawn()
+
+    def _spawn(self):
+        # scrcpy sometimes aborts with "Server connection failed" if the prior
+        # instance's phone-side server is still clearing — retried by _detect.
+        self._start_tries += 1
         self._log = open(r"C:\Users\Adam\PhoneDeck\scrcpy.log", "w",
                          encoding="utf-8", errors="replace")
         self.proc = subprocess.Popen(
-            [SCRCPY, "-s", target,
+            [SCRCPY, "-s", self.target,
              f"--new-display={DISPLAY_RES}",
-             "--keyboard=uhid", "--mouse=uhid",
+             "--keyboard=disabled", "--mouse=sdk",
              "--window-borderless", f"--window-title={EMBED_TITLE}",
              "--no-audio"],
             stdout=self._log, stderr=subprocess.STDOUT,
@@ -269,7 +327,16 @@ class ScrcpyEmbed(QWidget):
 
     def _detect_display(self):
         self._disp_tries += 1
-        if self.display_id is None and self.target:
+        if self.display_id is not None:
+            return
+        # scrcpy died early (the connection race) — retry a few times
+        if self.proc is not None and self.proc.poll() is not None:
+            self._disp_poll.stop()
+            self._win_poll.stop()
+            if self._start_tries < 6:
+                QTimer.singleShot(900, self._spawn)
+            return
+        if self.target:
             new = scrcpy_display_ids(self.target) - self._ids_before
             if new:
                 self.display_id = max(new)
@@ -310,6 +377,7 @@ class PhoneDeck(QMainWindow):
         self.resize(1180, 820)
         self.target = None
         self.apps = []
+        self.kb = KeyBridge()
 
         root = QWidget()
         self.setCentralWidget(root)
@@ -363,15 +431,58 @@ class PhoneDeck(QMainWindow):
         self.applist.itemClicked.connect(self.launch_selected)
         self.applist.setContextMenuPolicy(Qt.CustomContextMenu)
         self.applist.customContextMenuRequested.connect(self._app_menu)
+        self.applist.setFocusPolicy(Qt.NoFocus)   # don't swallow keystrokes
         sl.addWidget(self.applist, 1)
         body.addWidget(side)
 
         self.embed = ScrcpyEmbed()
         self.embed.display_ready.connect(self._display_ready)
+        self.embed.setFocusPolicy(Qt.StrongFocus)
         body.addWidget(self.embed, 1)
 
         self._apply_theme()
+        self._restore_geometry()
+        QApplication.instance().installEventFilter(self)
         QTimer.singleShot(200, self.connect_phone)
+
+    # -- keyboard: forward keystrokes to the phone unless the search box has
+    #    focus (so app-search typing still works) --
+    _SPECIAL = {
+        Qt.Key_Return: 66, Qt.Key_Enter: 66, Qt.Key_Backspace: 67,
+        Qt.Key_Tab: 61, Qt.Key_Space: 62, Qt.Key_Delete: 112,
+        Qt.Key_Escape: 111, Qt.Key_Left: 21, Qt.Key_Right: 22,
+        Qt.Key_Up: 19, Qt.Key_Down: 20, Qt.Key_Home: 122, Qt.Key_End: 123,
+    }
+
+    def eventFilter(self, obj, event):
+        if event.type() == QEvent.KeyPress:
+            if self.search.hasFocus():
+                return False                     # let app-search typing work
+            if not (self.target and self.embed.display_id is not None):
+                return False
+            k = event.key()
+            if k in self._SPECIAL:
+                self.kb.key(self._SPECIAL[k])
+                return True
+            t = event.text()
+            if t and t.isprintable():
+                self.kb.text(t)
+                return True
+        return super().eventFilter(obj, event)
+
+    # -- window placement (persist; default to the right-most monitor) --
+    def _restore_geometry(self):
+        s = QSettings("PhoneDeck", "PhoneDeck")
+        geo = s.value("geometry")
+        if geo is not None:
+            self.restoreGeometry(geo)
+            return
+        screens = QApplication.screens()
+        target = max(screens, key=lambda sc: sc.geometry().x())
+        g = target.availableGeometry()
+        self.resize(min(1400, g.width() - 80), min(900, g.height() - 80))
+        self.move(g.x() + (g.width() - self.width()) // 2,
+                  g.y() + (g.height() - self.height()) // 2)
 
     # -- theme --
     def _apply_theme(self):
@@ -411,6 +522,8 @@ class PhoneDeck(QMainWindow):
 
     def _display_ready(self, did):
         self.status.setText(f"Connected  ({self.target})")
+        self.kb.start(self.target, did)
+        self.embed.setFocus()
 
     # -- apps --
     def load_apps(self):
@@ -510,6 +623,9 @@ class PhoneDeck(QMainWindow):
 
     # -- lifecycle --
     def closeEvent(self, e):
+        QSettings("PhoneDeck", "PhoneDeck").setValue("geometry",
+                                                     self.saveGeometry())
+        self.kb.stop()
         self.embed.stop()
         super().closeEvent(e)
 
