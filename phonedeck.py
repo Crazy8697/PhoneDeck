@@ -524,7 +524,10 @@ class ScrcpyEmbed(QWidget):
         # instance's phone-side server is still clearing — retried by _detect.
         self._start_tries += 1
         self._log = open(SCRCPY_LOG, "w", encoding="utf-8", errors="replace")
-        res = f"{cfg_get('resolution')}/{cfg_get('dpi', int)}"
+        w, h = cfg_get("resolution").split("x")
+        if cfg().value("portrait", False, type=bool):
+            w, h = h, w                          # swap for portrait
+        res = f"{w}x{h}/{cfg_get('dpi', int)}"
         self.proc = subprocess.Popen(
             [SCRCPY, "-s", self.target,
              f"--new-display={res}",
@@ -620,28 +623,51 @@ class PhoneDeck(QMainWindow):
         self.kb = KeyBridge()   # adb bridge, now only for wheel-scroll swipes
         self.wheel = WheelBridge(self.kb, self)
 
-        # menu bar + sidebar toggle (small button left of "File")
-        mb = self.menuBar()
+        # custom top bar: drawer toggle, rotate, File dropdown
+        root = QWidget()
+        self.setCentralWidget(root)
+        outer = QVBoxLayout(root)
+        outer.setContentsMargins(0, 0, 0, 0)
+        outer.setSpacing(0)
+
+        topbar = QFrame()
+        topbar.setFixedHeight(30)
+        topbar.setStyleSheet("background:#15181d;")
+        tl = QHBoxLayout(topbar)
+        tl.setContentsMargins(6, 2, 6, 2)
+        tl.setSpacing(4)
         self._side_btn = QToolButton()
         self._side_btn.setText("☰")
-        self._side_btn.setAutoRaise(True)
         self._side_btn.setCursor(Qt.PointingHandCursor)
         self._side_btn.setToolTip("Show/hide app drawer")
         self._side_btn.clicked.connect(self._toggle_sidebar)
-        mb.setCornerWidget(self._side_btn, Qt.TopLeftCorner)
-        fm = mb.addMenu("File")
+        tl.addWidget(self._side_btn)
+        self._rot_btn = QToolButton()
+        self._rot_btn.setText("⟳")
+        self._rot_btn.setCursor(Qt.PointingHandCursor)
+        self._rot_btn.setToolTip("Rotate: portrait / landscape")
+        self._rot_btn.clicked.connect(self._toggle_orientation)
+        tl.addWidget(self._rot_btn)
+        file_btn = QToolButton()
+        file_btn.setText("File")
+        file_btn.setPopupMode(QToolButton.InstantPopup)
+        fm = QMenu(self)
         fm.addAction("Refresh apps", self.load_apps)
         fm.addAction("Reconnect", self.reconnect)
         fm.addAction("Device search…", self.device_search)
         fm.addSeparator()
         fm.addAction("Settings…", self.open_settings)
+        file_btn.setMenu(fm)
+        tl.addWidget(file_btn)
+        tl.addStretch(1)
+        outer.addWidget(topbar)
 
         # body: sidebar + display
-        root = QWidget()
-        self.setCentralWidget(root)
-        body = QHBoxLayout(root)
+        bodyw = QWidget()
+        body = QHBoxLayout(bodyw)
         body.setContentsMargins(0, 0, 0, 0)
         body.setSpacing(0)
+        outer.addWidget(bodyw, 1)
 
         self.side = side = QFrame()
         side.setFixedWidth(260)
@@ -709,6 +735,12 @@ class PhoneDeck(QMainWindow):
         self.side.setVisible(not self.side.isVisible())
         QTimer.singleShot(0, self.embed._fit)   # display fills the freed space
 
+    def _toggle_orientation(self):
+        c = cfg()
+        c.setValue("portrait", not c.value("portrait", False, type=bool))
+        if self.target:
+            self.embed.start(self.target)       # recreate display, swapped W×H
+
     # -- window placement (persist; default to the right-most monitor) --
     def _restore_geometry(self):
         s = QSettings("PhoneDeck", "PhoneDeck")
@@ -744,6 +776,11 @@ class PhoneDeck(QMainWindow):
             QMenu { background:#15181d; color:#e6e9ee; border:1px solid #2a2f38; }
             QMenu::item:selected { background:#243044; }
             QStatusBar { background:#15181d; color:#9aa4b2; }
+            QToolButton { background:transparent; color:#d7dbe2; border:none;
+                          border-radius:5px; padding:2px 9px; font-size:14px; }
+            QToolButton:hover { background:#243044; }
+            QToolButton:pressed { background:#2c3540; }
+            QToolButton::menu-indicator { image:none; width:0; }
             QComboBox { background:#1b1f26; border:1px solid #2a2f38;
                         border-radius:6px; padding:4px; }
             QSpinBox { background:#1b1f26; border:1px solid #2a2f38;
