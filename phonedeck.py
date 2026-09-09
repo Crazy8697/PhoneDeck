@@ -14,9 +14,11 @@ import ctypes
 from ctypes import wintypes
 import json
 import os
+import queue
 import re
 import subprocess
 import sys
+import threading
 import time
 
 from PySide6.QtCore import Qt, QTimer, QThread, Signal, QSettings, QEvent
@@ -320,64 +322,59 @@ class PushWorker(QThread):
 
 # ---- keyboard bridge ------------------------------------------------------
 class KeyBridge:
-    """Forwards PC keystrokes to the phone's virtual display over a single
-    persistent `adb shell` (fast + ordered), since scrcpy's own keyboard can't
-    reach the embedded virtual display."""
+    """Forwards PC keystrokes to the phone's virtual display. Each command runs
+    as its own direct `adb -s T shell input -d <id> ...` (executed in order by a
+    worker thread), because a persistent piped `adb shell` buffers/delays the
+    commands — text then commits to whatever field is focused when the backlog
+    finally drains (landing in the wrong chat)."""
 
     def __init__(self):
-        self.proc = None
         self.did = None
+        self.target = None
+        self._q = queue.Queue()
+        self._worker = None
+        self._running = False
 
     def start(self, target, did):
         self.stop()
+        self._q = queue.Queue()   # fresh queue (stop() left a poison None)
+        self.target = target
         self.did = did
-        try:
-            self.proc = subprocess.Popen(
-                [ADB, "-s", target, "shell"],
-                stdin=subprocess.PIPE, stdout=subprocess.DEVNULL,
-                stderr=subprocess.DEVNULL, text=True, encoding="utf-8",
-                creationflags=CREATE_NO_WINDOW)
-            self.warmup()
-        except Exception:
-            self.proc = None
+        self._running = True
+        self._worker = threading.Thread(target=self._run, daemon=True)
+        self._worker.start()
 
-    def warmup(self):
-        # the first `input` after idle is slow (framework load); prime it so
-        # real keystrokes don't queue behind a cold, slow first command
-        if self.did is not None:
-            self._send(f"input -d {self.did} keyevent 0")
-
-    def _send(self, line):
-        if self.proc and self.proc.poll() is None:
+    def _run(self):
+        while self._running:
             try:
-                self.proc.stdin.write(line + "\n")
-                self.proc.stdin.flush()
-            except Exception:
-                pass
+                cmd = self._q.get(timeout=0.4)
+            except queue.Empty:
+                continue
+            if cmd is None:
+                break
+            run([ADB, "-s", self.target, "shell", cmd], timeout=15)
+
+    def _enqueue(self, cmd):
+        if self.did is not None and self._running:
+            self._q.put(cmd)
 
     def key(self, code):
-        if self.did is not None:
-            self._send(f"input -d {self.did} keyevent {code}")
+        self._enqueue(f"input -d {self.did} keyevent {code}")
 
-    def text(self, ch):
-        if self.did is None:
-            return
-        esc = ch.replace("'", "'\\''")           # safe inside single quotes
-        self._send(f"input -d {self.did} text '{esc}'")
+    def text(self, s):
+        esc = s.replace("'", "'\\''")            # safe inside single quotes
+        self._enqueue(f"input -d {self.did} text '{esc}'")
 
     def swipe(self, x1, y1, x2, y2, ms=60):
-        if self.did is not None:
-            self._send(f"input -d {self.did} swipe {x1} {y1} {x2} {y2} {ms}")
+        self._enqueue(f"input -d {self.did} swipe {x1} {y1} {x2} {y2} {ms}")
 
     def stop(self):
-        if self.proc:
-            try:
-                self.proc.stdin.close()
-            except Exception:
-                pass
-            if self.proc.poll() is None:
-                self.proc.terminate()
-        self.proc = None
+        self._running = False
+        try:
+            self._q.put_nowait(None)
+        except Exception:
+            pass
+        self.did = None
 
 
 # ---- wheel bridge ---------------------------------------------------------
@@ -440,8 +437,6 @@ class WheelBridge:
                 # keyboard follows the last click: search box -> search,
                 # everything else (display, apps, nav) -> phone
                 self.main.kb_to_phone = not self.main._search_hit()
-                if self.main.kb_to_phone:      # about to type on the phone
-                    self.kb.warmup()           # prime input so 1st key isn't cold
             if (nCode == 0 and wParam == _WM_MOUSEWHEEL
                     and self.kb.did is not None and self._hot()):
                 now = time.monotonic()
@@ -533,6 +528,12 @@ class ScrcpyEmbed(QWidget):
         win32gui.SetWindowLong(hwnd, win32con.GWL_STYLE, style)
         win32gui.SetParent(hwnd, int(self.winId()))
         self._fit()
+        # The first fit can land relative to a stale origin (the reparent
+        # hasn't fully settled the instant the window appears), leaving the
+        # child parked off-screen. Re-fit after layout settles so it can't
+        # stick there.
+        for ms in (150, 500, 1500):
+            QTimer.singleShot(ms, self._fit)
         try:   # drop scrcpy's own file-drop target so drops bubble to Qt
             ole = ctypes.windll.ole32
             ole.RevokeDragDrop.argtypes = [ctypes.c_void_p]
