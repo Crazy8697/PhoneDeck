@@ -10,16 +10,18 @@ navigation go straight over adb, so nothing depends on scrcpy's own shortcuts
 or on Android's flaky secondary-display behavior.
 """
 
+import json
+import os
 import re
 import subprocess
 import sys
 import time
 
 from PySide6.QtCore import Qt, QTimer, QThread, Signal
-from PySide6.QtGui import QFont
+from PySide6.QtGui import QFont, QColor
 from PySide6.QtWidgets import (
     QApplication, QWidget, QMainWindow, QHBoxLayout, QVBoxLayout, QLineEdit,
-    QListWidget, QListWidgetItem, QPushButton, QLabel, QFrame,
+    QListWidget, QListWidgetItem, QPushButton, QLabel, QFrame, QMenu,
 )
 
 import win32gui
@@ -35,6 +37,8 @@ EMBED_TITLE = "PhoneDeckDisplay"   # unique scrcpy window title we reparent
 DISPLAY_RES = "1600x900/240"       # virtual external display size/density
 
 NAV_KEYS = {"Back": 4, "Home": 3, "Recents": 187}
+FAV_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                        "favorites.json")
 
 _SCRCPY_VDISP_RE = re.compile(
     r"displayId=(\d+), uniqueId=.virtual:com\.android\.shell,2000,scrcpy,")
@@ -92,6 +96,23 @@ def resolve_target():
 
 
 _PKG_RE = re.compile(r"^[A-Za-z][A-Za-z0-9_]*(?:\.[A-Za-z0-9_]+)+$")
+
+
+def load_favorites():
+    """Set of favorited package names, persisted in favorites.json."""
+    try:
+        with open(FAV_FILE, encoding="utf-8") as f:
+            return set(json.load(f))
+    except Exception:
+        return set()
+
+
+def save_favorites(favs):
+    try:
+        with open(FAV_FILE, "w", encoding="utf-8") as f:
+            json.dump(sorted(favs), f, indent=2)
+    except Exception:
+        pass
 
 
 def kill_orphan_embeds():
@@ -334,9 +355,12 @@ class PhoneDeck(QMainWindow):
         self.search.setPlaceholderText("Search apps…")
         self.search.textChanged.connect(self.filter_apps)
         sl.addWidget(self.search)
+        self.favorites = load_favorites()
         self.applist = QListWidget()
         self.applist.itemActivated.connect(self.launch_selected)
         self.applist.itemClicked.connect(self.launch_selected)
+        self.applist.setContextMenuPolicy(Qt.CustomContextMenu)
+        self.applist.customContextMenuRequested.connect(self._app_menu)
         sl.addWidget(self.applist, 1)
         body.addWidget(side)
 
@@ -402,19 +426,60 @@ class PhoneDeck(QMainWindow):
         self.apps = apps
         self.filter_apps(self.search.text())
 
+    def _add_header(self, text):
+        it = QListWidgetItem(text)
+        it.setFlags(Qt.NoItemFlags)          # non-selectable divider
+        it.setForeground(QColor("#6b7480"))
+        f = it.font(); f.setBold(True); f.setPointSize(max(8, f.pointSize() - 1))
+        it.setFont(f)
+        self.applist.addItem(it)
+
+    def _add_app(self, label, pkg):
+        star = "★ " if pkg in self.favorites else ""
+        it = QListWidgetItem(star + label)
+        it.setData(Qt.UserRole, pkg)
+        self.applist.addItem(it)
+
     def filter_apps(self, text):
         text = (text or "").lower()
         self.applist.clear()
-        for label, pkg in self.apps:
-            if text in label.lower() or text in pkg.lower():
-                it = QListWidgetItem(label)
-                it.setData(Qt.UserRole, pkg)
-                self.applist.addItem(it)
+        match = lambda l, p: text in l.lower() or text in p.lower()
+        favs = [(l, p) for (l, p) in self.apps
+                if p in self.favorites and match(l, p)]
+        if favs:
+            self._add_header("★  FAVORITES")
+            for l, p in favs:
+                self._add_app(l, p)
+            self._add_header("ALL APPS")
+        for l, p in self.apps:
+            if match(l, p):
+                self._add_app(l, p)
+
+    def _app_menu(self, pos):
+        item = self.applist.itemAt(pos)
+        if not item:
+            return
+        pkg = item.data(Qt.UserRole)
+        if not pkg:
+            return
+        menu = QMenu(self)
+        fav = pkg in self.favorites
+        act = menu.addAction("Remove from Favorites" if fav
+                             else "Add to Favorites")
+        if menu.exec(self.applist.mapToGlobal(pos)) == act:
+            if fav:
+                self.favorites.discard(pkg)
+            else:
+                self.favorites.add(pkg)
+            save_favorites(self.favorites)
+            self.filter_apps(self.search.text())
 
     def launch_selected(self, item):
         if not item or not self.target:
             return
         pkg = item.data(Qt.UserRole)
+        if not pkg:                          # header row
+            return
         did = self.embed.display_id
         if did is None:
             # display not ready yet — fall back to phone screen
