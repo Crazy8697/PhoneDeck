@@ -302,7 +302,7 @@ class ScrcpyEmbed(QWidget):
         self.proc = subprocess.Popen(
             [SCRCPY, "-s", self.target,
              f"--new-display={DISPLAY_RES}",
-             "--keyboard=disabled", "--mouse=sdk",
+             "--keyboard=uhid", "--mouse=sdk",
              "--window-borderless", f"--window-title={EMBED_TITLE}",
              "--no-audio"],
             stdout=self._log, stderr=subprocess.STDOUT,
@@ -321,9 +321,14 @@ class ScrcpyEmbed(QWidget):
         style = win32gui.GetWindowLong(hwnd, win32con.GWL_STYLE)
         style = (style & ~win32con.WS_POPUP & ~win32con.WS_CAPTION
                  & ~win32con.WS_THICKFRAME) | win32con.WS_CHILD
+        style |= win32con.WS_TABSTOP           # allow keyboard focus
         win32gui.SetWindowLong(hwnd, win32con.GWL_STYLE, style)
         win32gui.SetParent(hwnd, int(self.winId()))
         self._fit()
+        try:
+            win32gui.SetFocus(hwnd)             # hand scrcpy the keyboard
+        except Exception:
+            pass
 
     def _detect_display(self):
         self._disp_tries += 1
@@ -377,7 +382,8 @@ class PhoneDeck(QMainWindow):
         self.resize(1180, 820)
         self.target = None
         self.apps = []
-        self.kb = KeyBridge()
+        self.kb = KeyBridge()   # adb keyboard fallback (used only if the
+                                # embedded display doesn't hold Windows focus)
 
         root = QWidget()
         self.setCentralWidget(root)
@@ -523,7 +529,6 @@ class PhoneDeck(QMainWindow):
     def _display_ready(self, did):
         self.status.setText(f"Connected  ({self.target})")
         self.kb.start(self.target, did)
-        self.embed.setFocus()
 
     # -- apps --
     def load_apps(self):
