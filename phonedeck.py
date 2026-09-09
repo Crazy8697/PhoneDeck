@@ -20,7 +20,7 @@ import sys
 import time
 
 from PySide6.QtCore import Qt, QTimer, QThread, Signal, QSettings, QEvent
-from PySide6.QtGui import QFont, QColor, QCursor
+from PySide6.QtGui import QFont, QColor, QCursor, QIcon
 from PySide6.QtWidgets import (
     QApplication, QWidget, QMainWindow, QHBoxLayout, QVBoxLayout, QLineEdit,
     QListWidget, QListWidgetItem, QPushButton, QLabel, QFrame, QMenu,
@@ -38,6 +38,8 @@ SCRCPY = SCRCPY_DIR + r"\scrcpy.exe"
 SERIAL = "3C210DLJG002RN"          # Pixel 8 Pro USB serial
 PHONE_IP = "10.42.69.170"          # DHCP-reserved; used for the 5555 fallback
 EMBED_TITLE = "PhoneDeckDisplay"   # unique scrcpy window title we reparent
+ICON_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                         "phonedeck.ico")
 DISPLAY_RES = "1600x900/240"       # virtual external display size/density
 
 NAV_KEYS = {"Back": 4, "Home": 3, "Recents": 187}
@@ -51,10 +53,10 @@ CREATE_NO_WINDOW = 0x08000000      # keep adb/scrcpy console windows hidden
 
 # user settings (persisted via QSettings), with defaults
 SETTING_DEFAULTS = {
-    "resolution": "1600x900",  # virtual display W x H
-    "dpi": 240,                # virtual display density
-    "scroll_dist": 260,        # px of swipe per wheel tick
-    "scroll_natural": True,    # wheel up scrolls content up
+    "resolution": "1920x1080",  # virtual display W x H
+    "dpi": 180,                 # virtual display density
+    "scroll_dist": 260,         # px of swipe per wheel tick
+    "scroll_natural": True,     # wheel up scrolls content up
 }
 
 
@@ -492,6 +494,7 @@ class PhoneDeck(QMainWindow):
     def __init__(self):
         super().__init__()
         self.setWindowTitle("PhoneDeck")
+        self.setWindowIcon(QIcon(ICON_PATH))
         self.resize(1180, 820)
         self.target = None
         self.apps = []
@@ -631,8 +634,18 @@ class PhoneDeck(QMainWindow):
             QMenu { background:#15181d; color:#e6e9ee; border:1px solid #2a2f38; }
             QMenu::item:selected { background:#243044; }
             QStatusBar { background:#15181d; color:#9aa4b2; }
-            QComboBox, QSpinBox { background:#1b1f26; border:1px solid #2a2f38;
-                                  border-radius:6px; padding:4px; }
+            QComboBox { background:#1b1f26; border:1px solid #2a2f38;
+                        border-radius:6px; padding:4px; }
+            QSpinBox { background:#1b1f26; border:1px solid #2a2f38;
+                       border-radius:6px; padding:4px 22px 4px 6px; }
+            QSpinBox::up-button { subcontrol-origin:border;
+                subcontrol-position:top right; width:20px; background:#232a34;
+                border-left:1px solid #2a2f38; border-top-right-radius:6px; }
+            QSpinBox::down-button { subcontrol-origin:border;
+                subcontrol-position:bottom right; width:20px; background:#232a34;
+                border-left:1px solid #2a2f38; border-bottom-right-radius:6px; }
+            QSpinBox::up-button:hover, QSpinBox::down-button:hover {
+                background:#2c3540; }
             QDialog { background:#101317; }
         """)
 
@@ -848,7 +861,13 @@ class PhoneDeck(QMainWindow):
 
 
 def main():
+    try:   # make Windows use our icon in the taskbar, not python's
+        ctypes.windll.shell32.SetCurrentProcessExplicitAppUserModelID(
+            "PhoneDeck.App")
+    except Exception:
+        pass
     app = QApplication(sys.argv)
+    app.setWindowIcon(QIcon(ICON_PATH))
     app.setFont(QFont("JetBrainsMono NFM", 10))
     w = PhoneDeck()
     w.show()
