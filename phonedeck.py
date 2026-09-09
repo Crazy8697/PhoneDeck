@@ -376,6 +376,7 @@ class KeyBridge:
 # ---- wheel bridge ---------------------------------------------------------
 _WH_MOUSE_LL = 14
 _WM_MOUSEWHEEL = 0x020A
+_WM_LBUTTONDOWN = 0x0201
 
 
 class _MSLLHOOKSTRUCT(ctypes.Structure):
@@ -389,12 +390,15 @@ _LL_PROC = ctypes.CFUNCTYPE(ctypes.c_ssize_t, ctypes.c_int, wintypes.WPARAM,
 
 
 class WheelBridge:
-    """Low-level mouse hook: the reparented scrcpy child ignores the wheel, so
-    forward wheel-over-display into adb swipes on the virtual display."""
+    """Low-level mouse hook. Two jobs: (1) forward wheel-over-display as adb
+    swipes (the reparented scrcpy child ignores the wheel); (2) on each click,
+    route the keyboard — click the search box -> keys go to search, click
+    anywhere else -> keys go to the phone."""
 
-    def __init__(self, kb, is_hot):
+    def __init__(self, kb, main):
         self.kb = kb
-        self._hot = is_hot           # callable -> bool (window active + over display)
+        self.main = main
+        self._hot = main._display_hot   # callable -> bool (active + over display)
         self._hook = None
         self._cb = _LL_PROC(self._proc)   # keep the callback ref alive
         self._last = 0.0
@@ -424,6 +428,11 @@ class WheelBridge:
 
     def _proc(self, nCode, wParam, lParam):
         try:
+            if (nCode == 0 and wParam == _WM_LBUTTONDOWN
+                    and self.main.isActiveWindow()):
+                # keyboard follows the last click: search box -> search,
+                # everything else (display, apps, nav) -> phone
+                self.main.kb_to_phone = not self.main._search_hit()
             if (nCode == 0 and wParam == _WM_MOUSEWHEEL
                     and self.kb.did is not None and self._hot()):
                 now = time.monotonic()
@@ -579,7 +588,8 @@ class PhoneDeck(QMainWindow):
         self.kb = KeyBridge()   # forwards keystrokes to the virtual display
                                 # (adb `input -d <id>`) — the only path that
                                 # targets the external display, not the phone
-        self.wheel = WheelBridge(self.kb, self._display_hot)
+        self.kb_to_phone = True  # keyboard target; flipped by clicks (WheelBridge)
+        self.wheel = WheelBridge(self.kb, self)
 
         # menu bar
         fm = self.menuBar().addMenu("File")
@@ -654,6 +664,13 @@ class PhoneDeck(QMainWindow):
         return (tl.x() <= gp.x() <= tl.x() + self.embed.width() and
                 tl.y() <= gp.y() <= tl.y() + self.embed.height())
 
+    def _search_hit(self):
+        # is the cursor over the app-search box right now?
+        gp = QCursor.pos()
+        tl = self.search.mapToGlobal(self.search.rect().topLeft())
+        return (tl.x() <= gp.x() <= tl.x() + self.search.width() and
+                tl.y() <= gp.y() <= tl.y() + self.search.height())
+
     def _display_hot(self):
         # for the global wheel hook: only act when PhoneDeck is active and the
         # cursor is over the display
@@ -663,9 +680,9 @@ class PhoneDeck(QMainWindow):
         if event.type() == QEvent.KeyPress:
             if not (self.target and self.embed.display_id is not None):
                 return False
-            # keys go to the phone only while the cursor is over the display;
-            # over the sidebar they fall through to the search box
-            if not self._mouse_over_display():
+            # keyboard follows the last click: search box -> Qt search,
+            # anything else -> the phone
+            if not self.kb_to_phone:
                 return False
             k = event.key()
             if k in self._SPECIAL:
