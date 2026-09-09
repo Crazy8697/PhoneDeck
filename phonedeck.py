@@ -10,6 +10,8 @@ navigation go straight over adb, so nothing depends on scrcpy's own shortcuts
 or on Android's flaky secondary-display behavior.
 """
 
+import ctypes
+from ctypes import wintypes
 import json
 import os
 import re
@@ -22,6 +24,8 @@ from PySide6.QtGui import QFont, QColor, QCursor
 from PySide6.QtWidgets import (
     QApplication, QWidget, QMainWindow, QHBoxLayout, QVBoxLayout, QLineEdit,
     QListWidget, QListWidgetItem, QPushButton, QLabel, QFrame, QMenu,
+    QDialog, QComboBox, QSpinBox, QSlider, QCheckBox, QDialogButtonBox,
+    QFormLayout,
 )
 
 import win32gui
@@ -44,6 +48,22 @@ _SCRCPY_VDISP_RE = re.compile(
     r"displayId=(\d+), uniqueId=.virtual:com\.android\.shell,2000,scrcpy,")
 
 CREATE_NO_WINDOW = 0x08000000      # keep adb/scrcpy console windows hidden
+
+# user settings (persisted via QSettings), with defaults
+SETTING_DEFAULTS = {
+    "resolution": "1600x900",  # virtual display W x H
+    "dpi": 240,                # virtual display density
+    "scroll_dist": 260,        # px of swipe per wheel tick
+    "scroll_natural": True,    # wheel up scrolls content up
+}
+
+
+def cfg():
+    return QSettings("PhoneDeck", "PhoneDeck")
+
+
+def cfg_get(key, typ=str):
+    return cfg().value(key, SETTING_DEFAULTS[key], type=typ)
 
 
 def run(args, timeout=20):
@@ -123,6 +143,28 @@ def kill_orphan_embeds():
           f"Where-Object {{ $_.CommandLine -like '*{EMBED_TITLE}*' }} | "
           "ForEach-Object { Stop-Process -Id $_.ProcessId -Force }")
     run(["powershell", "-NoProfile", "-Command", ps], timeout=15)
+
+
+def list_devices():
+    """Connectable devices: currently-connected adb devices + wireless-debugging
+    devices found via mDNS. Returns [(label, target)]."""
+    devices, seen = [], set()
+    rc, o = run([ADB, "devices"])
+    for line in o.splitlines():
+        m = re.match(r"^(\S+)\s+device$", line)
+        if m and m.group(1) != "List":
+            t = m.group(1)
+            seen.add(t)
+            kind = "wireless" if re.match(r"\d+\.\d+\.\d+\.\d+:", t) else "USB"
+            devices.append((f"{t}   ({kind}, connected)", t))
+    rc, o = run([ADB, "mdns", "services"], timeout=8)
+    for line in o.splitlines():
+        if "_adb-tls-connect" in line:
+            m = re.search(r"(\d{1,3}(?:\.\d{1,3}){3}:\d+)", line)
+            if m and m.group(1) not in seen:
+                seen.add(m.group(1))
+                devices.append((f"{m.group(1)}   (wireless)", m.group(1)))
+    return devices
 
 
 def scrcpy_display_ids(target):
@@ -242,6 +284,10 @@ class KeyBridge:
         esc = ch.replace("'", "'\\''")           # safe inside single quotes
         self._send(f"input -d {self.did} text '{esc}'")
 
+    def swipe(self, x1, y1, x2, y2, ms=60):
+        if self.did is not None:
+            self._send(f"input -d {self.did} swipe {x1} {y1} {x2} {y2} {ms}")
+
     def stop(self):
         if self.proc:
             try:
@@ -251,6 +297,77 @@ class KeyBridge:
             if self.proc.poll() is None:
                 self.proc.terminate()
         self.proc = None
+
+
+# ---- wheel bridge ---------------------------------------------------------
+_WH_MOUSE_LL = 14
+_WM_MOUSEWHEEL = 0x020A
+
+
+class _MSLLHOOKSTRUCT(ctypes.Structure):
+    _fields_ = [("pt", wintypes.POINT), ("mouseData", wintypes.DWORD),
+                ("flags", wintypes.DWORD), ("time", wintypes.DWORD),
+                ("dwExtraInfo", ctypes.c_void_p)]
+
+
+_LL_PROC = ctypes.CFUNCTYPE(ctypes.c_ssize_t, ctypes.c_int, wintypes.WPARAM,
+                            ctypes.POINTER(_MSLLHOOKSTRUCT))
+
+
+class WheelBridge:
+    """Low-level mouse hook: the reparented scrcpy child ignores the wheel, so
+    forward wheel-over-display into adb swipes on the virtual display."""
+
+    def __init__(self, kb, is_hot):
+        self.kb = kb
+        self._hot = is_hot           # callable -> bool (window active + over display)
+        self._hook = None
+        self._cb = _LL_PROC(self._proc)   # keep the callback ref alive
+        self._last = 0.0
+        u = ctypes.windll.user32
+        u.SetWindowsHookExW.restype = ctypes.c_void_p
+        u.SetWindowsHookExW.argtypes = [ctypes.c_int, _LL_PROC,
+                                        ctypes.c_void_p, wintypes.DWORD]
+        u.CallNextHookEx.restype = ctypes.c_ssize_t
+        u.CallNextHookEx.argtypes = [ctypes.c_void_p, ctypes.c_int,
+                                     wintypes.WPARAM,
+                                     ctypes.POINTER(_MSLLHOOKSTRUCT)]
+        u.UnhookWindowsHookEx.argtypes = [ctypes.c_void_p]
+        self._u = u
+
+    def install(self):
+        if self._hook:
+            return
+        k = ctypes.windll.kernel32
+        k.GetModuleHandleW.restype = ctypes.c_void_p
+        hmod = k.GetModuleHandleW(None)
+        self._hook = self._u.SetWindowsHookExW(_WH_MOUSE_LL, self._cb, hmod, 0)
+
+    def remove(self):
+        if self._hook:
+            self._u.UnhookWindowsHookEx(self._hook)
+            self._hook = None
+
+    def _proc(self, nCode, wParam, lParam):
+        try:
+            if (nCode == 0 and wParam == _WM_MOUSEWHEEL
+                    and self.kb.did is not None and self._hot()):
+                now = time.monotonic()
+                if now - self._last >= 0.04:
+                    self._last = now
+                    raw = (lParam[0].mouseData >> 16) & 0xFFFF
+                    delta = raw - 0x10000 if raw & 0x8000 else raw
+                    dist = cfg_get("scroll_dist", int)
+                    natural = cfg_get("scroll_natural", bool)
+                    down = (delta < 0) == natural     # scroll content down?
+                    cx, cy = 800, 450
+                    half = max(40, dist // 2)
+                    y1, y2 = ((cy + half, cy - half) if down
+                              else (cy - half, cy + half))
+                    self.kb.swipe(cx, y1, cx, y2)
+        except Exception:
+            pass
+        return self._u.CallNextHookEx(None, nCode, wParam, lParam)
 
 
 # ---- embedded scrcpy ------------------------------------------------------
@@ -299,9 +416,10 @@ class ScrcpyEmbed(QWidget):
         self._start_tries += 1
         self._log = open(r"C:\Users\Adam\PhoneDeck\scrcpy.log", "w",
                          encoding="utf-8", errors="replace")
+        res = f"{cfg_get('resolution')}/{cfg_get('dpi', int)}"
         self.proc = subprocess.Popen(
             [SCRCPY, "-s", self.target,
-             f"--new-display={DISPLAY_RES}",
+             f"--new-display={res}",
              "--keyboard=disabled", "--mouse=sdk",
              "--window-borderless", f"--window-title={EMBED_TITLE}",
              "--no-audio"],
@@ -380,42 +498,22 @@ class PhoneDeck(QMainWindow):
         self.kb = KeyBridge()   # forwards keystrokes to the virtual display
                                 # (adb `input -d <id>`) — the only path that
                                 # targets the external display, not the phone
+        self.wheel = WheelBridge(self.kb, self._display_hot)
 
-        root = QWidget()
-        self.setCentralWidget(root)
-        outer = QVBoxLayout(root)
-        outer.setContentsMargins(0, 0, 0, 0)
-        outer.setSpacing(0)
-
-        # top nav bar
-        bar = QFrame()
-        bar.setFixedHeight(48)
-        bar.setStyleSheet("background:#15181d;")
-        bl = QHBoxLayout(bar)
-        bl.setContentsMargins(8, 6, 8, 6)
-        bl.setSpacing(6)
-        self.btn_refresh = QPushButton("Refresh apps")
-        self.btn_refresh.clicked.connect(self.load_apps)
-        bl.addWidget(self.btn_refresh)
-        self.btn_reconnect = QPushButton("Reconnect")
-        self.btn_reconnect.clicked.connect(self.connect_phone)
-        bl.addWidget(self.btn_reconnect)
-        bl.addStretch(1)
-        self.status = QLabel("Connecting…")
-        self.status.setStyleSheet("color:#9aa4b2;")
-        bl.addWidget(self.status)
-        bl.addStretch(1)
-        for name in ("Back", "Home", "Recents"):
-            b = QPushButton(name)
-            b.clicked.connect(lambda _=False, n=name: self.nav(n))
-            bl.addWidget(b)
-        outer.addWidget(bar)
+        # menu bar
+        fm = self.menuBar().addMenu("File")
+        fm.addAction("Refresh apps", self.load_apps)
+        fm.addAction("Reconnect", self.reconnect)
+        fm.addAction("Device search…", self.device_search)
+        fm.addSeparator()
+        fm.addAction("Settings…", self.open_settings)
 
         # body: sidebar + display
-        body = QHBoxLayout()
+        root = QWidget()
+        self.setCentralWidget(root)
+        body = QHBoxLayout(root)
         body.setContentsMargins(0, 0, 0, 0)
         body.setSpacing(0)
-        outer.addLayout(body, 1)
 
         side = QFrame()
         side.setFixedWidth(260)
@@ -435,12 +533,25 @@ class PhoneDeck(QMainWindow):
         self.applist.customContextMenuRequested.connect(self._app_menu)
         self.applist.setFocusPolicy(Qt.NoFocus)   # don't swallow keystrokes
         sl.addWidget(self.applist, 1)
+
+        # nav buttons under the app list
+        navrow = QHBoxLayout()
+        navrow.setSpacing(6)
+        for name in ("Back", "Home", "Recents"):
+            b = QPushButton(name)
+            b.setFocusPolicy(Qt.NoFocus)
+            b.clicked.connect(lambda _=False, n=name: self.nav(n))
+            navrow.addWidget(b)
+        sl.addLayout(navrow)
         body.addWidget(side)
 
         self.embed = ScrcpyEmbed()
         self.embed.display_ready.connect(self._display_ready)
         self.embed.setFocusPolicy(Qt.StrongFocus)
         body.addWidget(self.embed, 1)
+
+        self.status = self.statusBar()
+        self.status.showMessage("Connecting…")
 
         self._apply_theme()
         self._restore_geometry()
@@ -461,6 +572,11 @@ class PhoneDeck(QMainWindow):
         tl = self.embed.mapToGlobal(self.embed.rect().topLeft())
         return (tl.x() <= gp.x() <= tl.x() + self.embed.width() and
                 tl.y() <= gp.y() <= tl.y() + self.embed.height())
+
+    def _display_hot(self):
+        # for the global wheel hook: only act when PhoneDeck is active and the
+        # cursor is over the display
+        return self.isActiveWindow() and self._mouse_over_display()
 
     def eventFilter(self, obj, event):
         if event.type() == QEvent.KeyPress:
@@ -510,45 +626,136 @@ class PhoneDeck(QMainWindow):
             QPushButton:hover { background:#2c3540; }
             QPushButton:pressed { background:#3a4550; }
             QPushButton:disabled { color:#5b6472; background:#191d23; }
+            QMenuBar { background:#15181d; color:#e6e9ee; }
+            QMenuBar::item:selected { background:#243044; }
+            QMenu { background:#15181d; color:#e6e9ee; border:1px solid #2a2f38; }
+            QMenu::item:selected { background:#243044; }
+            QStatusBar { background:#15181d; color:#9aa4b2; }
+            QComboBox, QSpinBox { background:#1b1f26; border:1px solid #2a2f38;
+                                  border-radius:6px; padding:4px; }
+            QDialog { background:#101317; }
         """)
 
     # -- connection --
     def connect_phone(self):
-        self.status.setText("Connecting…")
-        self.btn_reconnect.setEnabled(False)
+        # auto-discover (USB → wireless), used on startup
+        self.status.showMessage("Connecting…")
         self._cw = ConnectWorker()
         self._cw.done.connect(self._connected)
         self._cw.start()
 
+    def reconnect(self):
+        # reconnect to the last good device if we have one, else auto-discover
+        last = QSettings("PhoneDeck", "PhoneDeck").value("last_target")
+        if last:
+            self.status.showMessage(f"Reconnecting  ({last})…")
+            run([ADB, "connect", last], timeout=10)
+            self._connected(last)
+        else:
+            self.connect_phone()
+
+    def connect_to(self, target):
+        # connect to a specific device chosen from Device search
+        run([ADB, "connect", target], timeout=10)
+        self._connected(target)
+
+    def device_search(self):
+        dlg = QDialog(self)
+        dlg.setWindowTitle("Device search")
+        dlg.resize(440, 340)
+        v = QVBoxLayout(dlg)
+        v.addWidget(QLabel("Devices (USB + wireless debugging):"))
+        lst = QListWidget()
+        v.addWidget(lst, 1)
+
+        def refresh():
+            lst.clear()
+            for label, target in list_devices():
+                it = QListWidgetItem(label)
+                it.setData(Qt.UserRole, target)
+                lst.addItem(it)
+            if lst.count():
+                lst.setCurrentRow(0)
+        refresh()
+
+        def do_connect():
+            it = lst.currentItem()
+            if it:
+                dlg.accept()
+                self.connect_to(it.data(Qt.UserRole))
+
+        lst.itemActivated.connect(lambda _: do_connect())
+        row = QHBoxLayout()
+        rb = QPushButton("Refresh"); rb.clicked.connect(refresh)
+        row.addWidget(rb); row.addStretch(1)
+        cb = QPushButton("Connect"); cb.clicked.connect(do_connect)
+        xb = QPushButton("Cancel"); xb.clicked.connect(dlg.reject)
+        row.addWidget(cb); row.addWidget(xb)
+        v.addLayout(row)
+        dlg.exec()
+
+    def open_settings(self):
+        dlg = QDialog(self)
+        dlg.setWindowTitle("Settings")
+        form = QFormLayout(dlg)
+        res = QComboBox()
+        res.addItems(["1280x720", "1600x900", "1920x1080"])
+        res.setCurrentText(cfg_get("resolution"))
+        dpi = QSpinBox(); dpi.setRange(120, 480); dpi.setSingleStep(20)
+        dpi.setValue(cfg_get("dpi", int))
+        scroll = QSpinBox(); scroll.setRange(60, 800); scroll.setSingleStep(20)
+        scroll.setSuffix(" px"); scroll.setValue(cfg_get("scroll_dist", int))
+        natural = QCheckBox("Natural (wheel up scrolls up)")
+        natural.setChecked(cfg_get("scroll_natural", bool))
+        form.addRow("Resolution", res)
+        form.addRow("Density (dpi)", dpi)
+        form.addRow("Scroll distance", scroll)
+        form.addRow("", natural)
+        note = QLabel("Resolution/density changes reconnect the display.")
+        note.setStyleSheet("color:#9aa4b2;")
+        form.addRow(note)
+        bb = QDialogButtonBox(QDialogButtonBox.Save | QDialogButtonBox.Cancel)
+        bb.accepted.connect(dlg.accept); bb.rejected.connect(dlg.reject)
+        form.addRow(bb)
+        if dlg.exec() == QDialog.Accepted:
+            old = (cfg_get("resolution"), cfg_get("dpi", int))
+            c = cfg()
+            c.setValue("resolution", res.currentText())
+            c.setValue("dpi", dpi.value())
+            c.setValue("scroll_dist", scroll.value())
+            c.setValue("scroll_natural", natural.isChecked())
+            if self.target and (res.currentText(), dpi.value()) != old:
+                self.embed.start(self.target)   # restart display at new size
+
     def _connected(self, target):
-        self.btn_reconnect.setEnabled(True)
         self.target = target
         if not target:
-            self.status.setText("Phone not found — USB or Wireless debugging?")
+            self.status.showMessage("Phone not found — USB or Wireless debugging?")
             return
-        self.status.setText(f"Connected  ({target})")
+        QSettings("PhoneDeck", "PhoneDeck").setValue("last_target", target)
+        self.status.showMessage(f"Connected  ({target})")
         self.embed.start(target)
         self.load_apps()
 
     def _display_ready(self, did):
-        self.status.setText(f"Connected  ({self.target})")
+        self.status.showMessage(f"Connected  ({self.target})")
         self.kb.start(self.target, did)
+        self.wheel.install()
 
     # -- apps --
     def load_apps(self):
         if not self.target:
             return
-        self.btn_refresh.setEnabled(False)
-        self.btn_refresh.setText("Loading…")
+        self.status.showMessage("Loading apps…")
         self._aw = AppsWorker(self.target)
         self._aw.done.connect(self._apps_loaded)
         self._aw.start()
 
     def _apps_loaded(self, apps):
-        self.btn_refresh.setEnabled(True)
-        self.btn_refresh.setText("Refresh apps")
         self.apps = apps
         self.filter_apps(self.search.text())
+        if self.target:
+            self.status.showMessage(f"Connected  ({self.target})")
 
     def _add_header(self, text):
         it = QListWidgetItem(text)
@@ -634,6 +841,7 @@ class PhoneDeck(QMainWindow):
     def closeEvent(self, e):
         QSettings("PhoneDeck", "PhoneDeck").setValue("geometry",
                                                      self.saveGeometry())
+        self.wheel.remove()
         self.kb.stop()
         self.embed.stop()
         super().closeEvent(e)
