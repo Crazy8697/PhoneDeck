@@ -30,7 +30,7 @@ from PySide6.QtWidgets import (
     QApplication, QWidget, QMainWindow, QHBoxLayout, QVBoxLayout, QLineEdit,
     QListWidget, QListWidgetItem, QPushButton, QLabel, QFrame, QMenu,
     QDialog, QComboBox, QSpinBox, QSlider, QCheckBox, QDialogButtonBox,
-    QFormLayout, QToolButton,
+    QFormLayout, QToolButton, QMessageBox,
 )
 
 import win32gui
@@ -200,6 +200,37 @@ def find_connect_after_pair(ip, tries=8):
                 if m and "connected" in run([ADB, "connect", m.group(1)])[1]:
                     return m.group(1)
         time.sleep(1.5)
+    return None
+
+
+APPS_ROOT = "/sdcard/Pictures/Apps"       # per-app drop folders live here
+
+
+def safe_folder(name):
+    """A filesystem- and shell-safe folder name from an app label (quotes and
+    path/wildcard chars removed so it can be single-quoted in adb shell)."""
+    name = re.sub(r"[\\/:*?\"'`<>|]+", "", name or "").strip().rstrip(".")
+    return name[:48] or "Unknown"
+
+
+def foreground_pkg(target, display_id):
+    """Package of the top/resumed activity on the given display, or None."""
+    if display_id is None:
+        return None
+    rc, out = run([ADB, "-s", target, "shell", "dumpsys", "activity",
+                   "activities"], timeout=12)
+    in_disp = False
+    for line in out.splitlines():
+        if re.search(rf"Display #{display_id}\b", line):
+            in_disp = True
+            continue
+        if in_disp:
+            if re.search(r"Display #\d+", line):    # reached the next display
+                break
+            m = re.search(r"ActivityRecord\{[0-9a-f]+ \S+ ([A-Za-z0-9_.]+)/",
+                          line)
+            if m:
+                return m.group(1)
     return None
 
 
@@ -576,30 +607,34 @@ class AppsWorker(QThread):
 
 
 class PushWorker(QThread):
-    """Push dropped files to the phone's Pictures/PhoneDeck folder and media-scan
-    each so they show up in Kik's (and any app's) image picker."""
-    done = Signal(int)          # number pushed
-    DEST = "/sdcard/Pictures/PhoneDeck"
+    """Push dropped files to a per-app folder under Pictures/Apps and media-scan
+    each so they show up in the app's (and any app's) image picker. Grouping by
+    app means one app's drops can be cleared without touching the rest."""
+    done = Signal(int, str)     # number pushed, dest folder
 
-    def __init__(self, target, files):
+    def __init__(self, target, files, dest):
         super().__init__()
         self.target = target
         self.files = files
+        self.dest = dest
 
     def run(self):
-        run([ADB, "-s", self.target, "shell", "mkdir", "-p", self.DEST])
+        # dest may contain spaces (e.g. "Blue Kik X"); single-quote it in every
+        # on-device shell command. `adb push` takes the remote path as one arg,
+        # so it needs no quoting.
+        run([ADB, "-s", self.target, "shell", f"mkdir -p '{self.dest}'"])
         n = 0
         for f in self.files:
             name = os.path.basename(f)
             rc, _ = run([ADB, "-s", self.target, "push", f,
-                         f"{self.DEST}/{name}"], timeout=300)
+                         f"{self.dest}/{name}"], timeout=300)
             if rc == 0:
                 run([ADB, "-s", self.target, "shell",
-                     "am", "broadcast", "-a",
-                     "android.intent.action.MEDIA_SCANNER_SCAN_FILE",
-                     "-d", f"file://{self.DEST}/{name}"], timeout=20)
+                     "am broadcast -a "
+                     "android.intent.action.MEDIA_SCANNER_SCAN_FILE "
+                     f"-d 'file://{self.dest}/{name}'"], timeout=20)
                 n += 1
-        self.done.emit(n)
+        self.done.emit(n, self.dest)
 
 
 # ---- keyboard bridge ------------------------------------------------------
@@ -1535,6 +1570,32 @@ class PhoneDeck(QMainWindow):
         cfg().setValue("app_profiles", json.dumps(profs))
         self.filter_apps(self.search.text())
 
+    def _clear_app_images(self, pkg):
+        """Delete the files PhoneDeck dropped into this app's folder."""
+        if not self.target:
+            self.status.showMessage("No device connected", 4000)
+            return
+        folder = safe_folder(self._app_label(pkg))
+        dest = f"{APPS_ROOT}/{folder}"
+        rc, out = run([ADB, "-s", self.target, "shell", f"ls -1 '{dest}'"],
+                      timeout=10)
+        files = [ln for ln in out.splitlines()
+                 if ln.strip() and "No such file" not in ln]
+        if not files:
+            self.status.showMessage(f"No dropped images for {folder}", 4000)
+            return
+        if QMessageBox.question(
+                self, "Clear images",
+                f"Delete {len(files)} image(s) from Pictures/Apps/{folder}?"
+                ) != QMessageBox.Yes:
+            return
+        run([ADB, "-s", self.target, "shell", f"rm -f '{dest}'/*"], timeout=30)
+        run([ADB, "-s", self.target, "shell",
+             "am broadcast -a android.intent.action.MEDIA_SCANNER_SCAN_FILE "
+             f"-d 'file://{dest}'"], timeout=20)
+        self.status.showMessage(
+            f"Cleared {len(files)} image(s) from {folder}", 5000)
+
     def _add_header(self, text):
         it = QListWidgetItem(text)
         it.setFlags(Qt.NoItemFlags)          # non-selectable divider
@@ -1587,6 +1648,8 @@ class PhoneDeck(QMainWindow):
         for a, val in ((a_def, None), (a_land, "landscape"), (a_port, "portrait")):
             a.setCheckable(True)
             a.setChecked(prof == val)
+        menu.addSeparator()
+        clear_act = menu.addAction("Clear dropped images")
         chosen = menu.exec(self.applist.mapToGlobal(pos))
         if chosen == fav_act:
             if fav:
@@ -1598,6 +1661,8 @@ class PhoneDeck(QMainWindow):
         elif chosen in (a_def, a_land, a_port):
             self._set_profile(pkg, {a_def: None, a_land: "landscape",
                                     a_port: "portrait"}[chosen])
+        elif chosen == clear_act:
+            self._clear_app_images(pkg)
 
     def launch_selected(self, item):
         if not item or not self.target:
@@ -1619,6 +1684,7 @@ class PhoneDeck(QMainWindow):
         self._launch_now(pkg)
 
     def _launch_now(self, pkg):
+        self._current_app = pkg          # fallback for per-app drop folder
         did = self.embed.display_id
         if did is None:
             # display not ready yet — fall back to phone screen
@@ -1643,20 +1709,36 @@ class PhoneDeck(QMainWindow):
         if self.target and e.mimeData().hasUrls():
             e.acceptProposedAction()
 
+    def _app_label(self, pkg):
+        """Human label for a package (from the loaded app list), else the pkg."""
+        for label, p in self.apps:
+            if p == pkg:
+                return label
+        return pkg or "Unknown"
+
+    def _current_folder_name(self):
+        """Folder name for the app currently in front (for per-app drops)."""
+        pkg = (foreground_pkg(self.target, self.embed.display_id)
+               or getattr(self, "_current_app", None))
+        return safe_folder(self._app_label(pkg)) if pkg else "Unknown"
+
     def dropEvent(self, e):
         files = [u.toLocalFile() for u in e.mimeData().urls()
                  if u.isLocalFile() and os.path.isfile(u.toLocalFile())]
         if not files or not self.target:
             return
         e.acceptProposedAction()
-        self.status.showMessage(f"Pushing {len(files)} file(s) to phone…")
-        self._pw = PushWorker(self.target, files)
+        folder = self._current_folder_name()
+        dest = f"{APPS_ROOT}/{folder}"
+        self.status.showMessage(f"Pushing {len(files)} file(s) to {folder}…")
+        self._pw = PushWorker(self.target, files, dest)
         self._pw.done.connect(self._pushed)
         self._pw.start()
 
-    def _pushed(self, n):
+    def _pushed(self, n, dest):
+        folder = dest.rsplit("/", 1)[-1]
         self.status.showMessage(
-            f"Pushed {n} file(s) to Pictures/PhoneDeck — pick them in the app")
+            f"Pushed {n} file(s) to Pictures/Apps/{folder} — pick them in the app")
 
     # -- nav --
     def nav(self, name):
