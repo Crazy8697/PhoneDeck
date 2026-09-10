@@ -176,19 +176,6 @@ def _setting(target, scope, key):
     return "" if out in ("null", "None") else out
 
 
-def get_volume(target):
-    """(current, max) for STREAM_MUSIC via media_session, or (None, None)."""
-    rc, out = run([ADB, "-s", target, "shell", "cmd", "media_session",
-                   "volume", "--stream", "3", "--get"], timeout=8)
-    m = re.search(r"volume is (\d+) in range \[\d+\.\.(\d+)\]", out)
-    return (int(m.group(1)), int(m.group(2))) if m else (None, None)
-
-
-def set_volume(target, n):
-    run([ADB, "-s", target, "shell", "cmd", "media_session", "volume",
-         "--stream", "3", "--set", str(n)], timeout=8)
-
-
 def dim_active(target):
     """True if the screen is in manual mode pinned to minimum brightness."""
     if _setting(target, "system", "screen_brightness_mode") != "0":
@@ -803,16 +790,6 @@ class PhoneDeck(QMainWindow):
         ctl_btn.setMenu(cm)
         tl.addWidget(ctl_btn)
         tl.addStretch(1)
-        self._vol_lbl = QLabel("🔊")
-        tl.addWidget(self._vol_lbl)
-        self._vol = QSlider(Qt.Horizontal)
-        self._vol.setFixedWidth(130)
-        self._vol.setToolTip("Media volume")
-        self._vol.setEnabled(False)
-        self._vol.valueChanged.connect(self._on_volume)
-        self._vol.sliderReleased.connect(
-            lambda: self.target and set_volume(self.target, self._vol.value()))
-        tl.addWidget(self._vol)
         outer.addWidget(topbar)
 
         # body: sidebar + display
@@ -991,26 +968,6 @@ class PhoneDeck(QMainWindow):
             return
         set_dim(self.target, self._dim_act.isChecked())
 
-    def _refresh_volume(self):
-        """Sync the volume slider to the phone's current media volume."""
-        if not self.target:
-            self._vol.setEnabled(False)
-            return
-        cur, mx = get_volume(self.target)
-        if mx:
-            self._vol.blockSignals(True)
-            self._vol.setRange(0, mx)
-            self._vol.setValue(cur)
-            self._vol.setEnabled(True)
-            self._vol.blockSignals(False)
-        else:
-            self._vol.setEnabled(False)
-
-    def _on_volume(self, val):
-        # apply on click or at end of a drag, not on every step while dragging
-        if self.target and not self._vol.isSliderDown():
-            set_volume(self.target, val)
-
     def _control_toggle(self, on_cmd, off_cmd):
         if not self.target:
             self.status.showMessage("No device connected", 4000)
@@ -1131,7 +1088,6 @@ class PhoneDeck(QMainWindow):
         self.status.showMessage(f"Connected  ({target})")
         self.embed.start(target)
         self.load_apps()
-        self._refresh_volume()
 
     def _display_ready(self, did):
         self.status.showMessage(f"Connected  ({self.target})")
