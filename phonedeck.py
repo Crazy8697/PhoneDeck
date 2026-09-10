@@ -205,6 +205,7 @@ def find_connect_after_pair(ip, tries=8):
 
 
 APPS_ROOT = "/sdcard/Pictures/Apps"       # per-app drop folders live here
+PUSH_STAGE = APPS_ROOT + "/_incoming"     # scrcpy drops land here, then moved
 
 
 def safe_folder(name):
@@ -835,6 +836,10 @@ class ScrcpyEmbed(QWidget):
                 "--display-ime-policy=hide",   # no on-screen keyboard (PC types)
                 "--window-borderless", f"--window-title={EMBED_TITLE}",
                 f"--video-bit-rate={cfg_get('bitrate_mbps', int)}M",
+                # any drop scrcpy grabs itself lands in a PhoneDeck-only staging
+                # dir (never /sdcard/Download), which the app then moves into
+                # the focused app's folder — see MainWindow._poll_stage
+                f"--push-target={PUSH_STAGE}/",
                 "--no-audio"]
         fps = cfg_get("max_fps", int)
         if fps > 0:
@@ -1066,6 +1071,9 @@ class PhoneDeck(QMainWindow):
         self._data_timer = QTimer(self)
         self._data_timer.setInterval(3000)
         self._data_timer.timeout.connect(self._tick_nerd_data)
+        self._stage_timer = QTimer(self)       # relocate scrcpy-grabbed drops
+        self._stage_timer.setInterval(2000)
+        self._stage_timer.timeout.connect(self._poll_stage)
 
         self._apply_theme()
         self._restore_geometry()
@@ -1555,6 +1563,8 @@ class PhoneDeck(QMainWindow):
         self.load_apps()
         self._data_base = None
         self._sync_data_monitor()
+        run([ADB, "-s", target, "shell", f"mkdir -p '{PUSH_STAGE}'"])
+        self._stage_timer.start()
 
     def _display_ready(self, did):
         self.status.showMessage(f"Connected  ({self.target})")
@@ -1767,6 +1777,34 @@ class PhoneDeck(QMainWindow):
         self.status.showMessage(
             f"Pushed {n} file(s) to Pictures/Apps/{folder} — pick them in the app")
 
+    def _poll_stage(self):
+        """Move files scrcpy dropped into the staging dir into the focused
+        app's folder. Safe because only scrcpy writes to PUSH_STAGE."""
+        if not self.target:
+            return
+        rc, out = run([ADB, "-s", self.target, "shell", f"ls -1 '{PUSH_STAGE}'"],
+                      timeout=8)
+        files = [ln for ln in out.splitlines()
+                 if ln.strip() and "No such file" not in ln]
+        if not files:
+            return
+        folder = self._current_folder_name()
+        dest = f"{APPS_ROOT}/{folder}"
+        run([ADB, "-s", self.target, "shell", f"mkdir -p '{dest}'"])
+        moved = 0
+        for name in files:
+            rc, _ = run([ADB, "-s", self.target, "shell",
+                         f"mv '{PUSH_STAGE}/{name}' '{dest}/'"], timeout=30)
+            if rc == 0:
+                run([ADB, "-s", self.target, "shell",
+                     "am broadcast -a "
+                     "android.intent.action.MEDIA_SCANNER_SCAN_FILE "
+                     f"-d 'file://{dest}/{name}'"], timeout=15)
+                moved += 1
+        if moved:
+            self.status.showMessage(
+                f"Moved {moved} dropped file(s) to Pictures/Apps/{folder}", 5000)
+
     # -- nav --
     def nav(self, name):
         if not self.target:
@@ -1782,6 +1820,7 @@ class PhoneDeck(QMainWindow):
     def closeEvent(self, e):
         QSettings("PhoneDeck", "PhoneDeck").setValue("geometry",
                                                      self.saveGeometry())
+        self._stage_timer.stop()
         self.wheel.remove()
         self.kb.stop()
         self.embed.stop()
