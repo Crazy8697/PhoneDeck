@@ -19,8 +19,10 @@ import re
 import subprocess
 import collections
 import sys
+import tempfile
 import threading
 import time
+import urllib.request
 
 from PySide6.QtCore import (Qt, QTimer, QThread, Signal, QSettings,
                             QPointF, QSize)
@@ -30,7 +32,7 @@ from PySide6.QtWidgets import (
     QApplication, QWidget, QMainWindow, QHBoxLayout, QVBoxLayout, QLineEdit,
     QListWidget, QListWidgetItem, QPushButton, QLabel, QFrame, QMenu,
     QDialog, QComboBox, QSpinBox, QCheckBox, QDialogButtonBox,
-    QFormLayout, QToolButton, QMessageBox,
+    QFormLayout, QToolButton, QMessageBox, QProgressDialog,
 )
 
 import win32gui
@@ -88,6 +90,35 @@ CREATE_NO_WINDOW = 0x08000000      # keep adb/scrcpy console windows hidden
 
 # user settings (persisted via QSettings), with defaults
 VERSION = "1.3.0"
+REPO = "Crazy8697/PhoneDeck"
+RELEASES_API = f"https://api.github.com/repos/{REPO}/releases/latest"
+RELEASES_URL = f"https://github.com/{REPO}/releases"
+
+
+def _ver_tuple(s):
+    """('v1.3.0' | '1.3.0') -> (1, 3, 0) for comparison."""
+    nums = re.findall(r"\d+", s or "")[:3]
+    return tuple(int(n) for n in nums) + (0,) * (3 - len(nums))
+
+
+def fetch_latest_release():
+    """Query GitHub for the latest release. Returns dict(version, url, notes,
+    html_url) or None on any failure (offline, rate-limited, etc.)."""
+    try:
+        req = urllib.request.Request(RELEASES_API, headers={
+            "User-Agent": "PhoneDeck", "Accept": "application/vnd.github+json"})
+        with urllib.request.urlopen(req, timeout=15) as r:
+            data = json.loads(r.read().decode("utf-8"))
+        asset = next((a for a in data.get("assets", [])
+                      if a.get("name", "").lower().endswith(".exe")), None)
+        return {
+            "version": data.get("tag_name", ""),
+            "url": asset["browser_download_url"] if asset else None,
+            "notes": data.get("body", ""),
+            "html_url": data.get("html_url", RELEASES_URL),
+        }
+    except Exception:
+        return None
 
 SETTING_DEFAULTS = {
     "res_landscape": "1920x1080",  # virtual display W x H, landscape
@@ -709,6 +740,45 @@ class Poller(QThread):
             self.moved.emit(moved, dest.rsplit("/", 1)[-1])
 
 
+class UpdateChecker(QThread):
+    """Fetch the latest release info off the UI thread."""
+    result = Signal(object)     # dict or None
+
+    def run(self):
+        self.result.emit(fetch_latest_release())
+
+
+class UpdateDownloader(QThread):
+    """Download the installer to a temp file, reporting progress."""
+    progress = Signal(int)      # percent (0-100)
+    done = Signal(str)          # saved path, or "" on failure
+
+    def __init__(self, url):
+        super().__init__()
+        self.url = url
+
+    def run(self):
+        try:
+            dest = os.path.join(tempfile.gettempdir(), "PhoneDeck-Update.exe")
+            req = urllib.request.Request(self.url,
+                                         headers={"User-Agent": "PhoneDeck"})
+            with urllib.request.urlopen(req, timeout=30) as r, \
+                    open(dest, "wb") as f:
+                total = int(r.headers.get("Content-Length", 0))
+                got = 0
+                while True:
+                    chunk = r.read(65536)
+                    if not chunk:
+                        break
+                    f.write(chunk)
+                    got += len(chunk)
+                    if total:
+                        self.progress.emit(int(got * 100 / total))
+            self.done.emit(dest)
+        except Exception:
+            self.done.emit("")
+
+
 # ---- keyboard bridge ------------------------------------------------------
 class KeyBridge:
     """Forwards PC keystrokes to the phone's virtual display. Each command runs
@@ -1045,6 +1115,7 @@ class PhoneDeck(QMainWindow):
         file_btn.setPopupMode(QToolButton.InstantPopup)
         fm = QMenu(self)
         fm.addAction("Settings…", self.open_settings)
+        fm.addAction("Check for updates…", lambda: self.check_updates(False))
         fm.addAction("About…", self.open_about)
         file_btn.setMenu(fm)
         tl.addWidget(file_btn)
@@ -1147,6 +1218,7 @@ class PhoneDeck(QMainWindow):
         self._apply_theme()
         self._restore_geometry()
         QTimer.singleShot(200, self.connect_phone)
+        QTimer.singleShot(4000, lambda: self.check_updates(silent=True))
 
     # Typing goes through scrcpy's own keyboard (instant) once the display
     # holds Windows focus; WheelBridge hands it focus on a display click.
@@ -1416,6 +1488,63 @@ class PhoneDeck(QMainWindow):
         self._data_lbl.setText(
             f"{teth}mobile  ↓{fmt_bytes(max(0, rx - self._data_base[0]))}"
             f" ↑{fmt_bytes(max(0, tx - self._data_base[1]))}{rate}")
+
+    # -- updates --
+    def check_updates(self, silent=False):
+        """Check GitHub for a newer release. silent=True only speaks up if an
+        update is available (used for the startup auto-check)."""
+        self._uc = UpdateChecker()
+        self._uc.result.connect(lambda d: self._on_update_result(d, silent))
+        self._uc.start()
+        if not silent:
+            self.status.showMessage("Checking for updates…", 3000)
+
+    def _on_update_result(self, d, silent):
+        if not d or not d.get("version"):
+            if not silent:
+                QMessageBox.information(self, "Updates",
+                                        "Couldn't reach GitHub to check.")
+            return
+        if _ver_tuple(d["version"]) <= _ver_tuple(VERSION):
+            if not silent:
+                QMessageBox.information(
+                    self, "Updates", f"You're on the latest version ({VERSION}).")
+            return
+        if not d.get("url"):
+            QMessageBox.information(
+                self, "Update available",
+                f"PhoneDeck {d['version']} is available.\n{d['html_url']}")
+            return
+        if QMessageBox.question(
+                self, "Update available",
+                f"PhoneDeck {d['version']} is available "
+                f"(you have {VERSION}).\n\nDownload and install now?"
+                ) == QMessageBox.Yes:
+            self._start_update_download(d["url"])
+
+    def _start_update_download(self, url):
+        self._up_dlg = QProgressDialog("Downloading update…", "Cancel",
+                                       0, 100, self)
+        self._up_dlg.setWindowTitle("Updating PhoneDeck")
+        self._up_dlg.setMinimumWidth(320)
+        self._dl = UpdateDownloader(url)
+        self._dl.progress.connect(self._up_dlg.setValue)
+        self._dl.done.connect(self._on_update_downloaded)
+        self._up_dlg.canceled.connect(self._dl.terminate)
+        self._dl.start()
+
+    def _on_update_downloaded(self, path):
+        self._up_dlg.close()
+        if not path:
+            QMessageBox.warning(self, "Update", "Download failed.")
+            return
+        try:                     # launch installer, then quit so it can replace
+            subprocess.Popen([path])
+        except Exception as ex:
+            QMessageBox.warning(self, "Update",
+                                f"Couldn't launch the installer:\n{ex}")
+            return
+        QApplication.quit()
 
     def open_about(self):
         dlg = QDialog(self)
