@@ -827,7 +827,9 @@ class WheelBridge:
                 # click the display -> hand keyboard focus to scrcpy (smooth
                 # typing straight to the phone). click the search box -> leave
                 # Qt focus alone so app-search typing works.
-                if not self.main._search_hit():
+                if self.main._search_hit():
+                    QTimer.singleShot(0, self.main._focus_search)
+                else:
                     QTimer.singleShot(0, lambda: force_focus(self.main.embed.hwnd))
             if (nCode == 0 and wParam == _WM_MOUSEWHEEL
                     and self.kb.did is not None and self._hot()):
@@ -1160,6 +1162,13 @@ class PhoneDeck(QMainWindow):
         tl = self.search.mapToGlobal(self.search.rect().topLeft())
         return (tl.x() <= gp.x() <= tl.x() + self.search.width() and
                 tl.y() <= gp.y() <= tl.y() + self.search.height())
+
+    def _focus_search(self):
+        # Reclaim WINDOWS keyboard focus for the Qt window (the scrcpy child may
+        # be holding it after a display click), then focus the search box — else
+        # keystrokes like Backspace leak to scrcpy/the phone instead of the box.
+        force_focus(int(self.winId()))
+        self.search.setFocus()
 
     def _display_hot(self):
         # for the global wheel hook: only act when PhoneDeck is active and the
