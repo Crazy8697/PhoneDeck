@@ -128,6 +128,46 @@ def _connected_devices():
     return usb, wl
 
 
+def _pc_gateways():
+    """IPv4 default gateways — the phone's own IP when the PC is a client on
+    the phone's hotspot (mDNS can't cross the hotspot, so this is how we find
+    the phone's address there)."""
+    ps = ("Get-NetIPConfiguration | Where-Object { $_.IPv4DefaultGateway } | "
+          "ForEach-Object { $_.IPv4DefaultGateway.NextHop }")
+    rc, out = run(["powershell", "-NoProfile", "-Command", ps], timeout=10)
+    return [ln.strip() for ln in out.splitlines()
+            if re.match(r"\d{1,3}(?:\.\d{1,3}){3}$", ln.strip())]
+
+
+def enable_wifi_over_usb():
+    """Phone on USB → put adbd in tcpip mode (listens on 5555 on ALL
+    interfaces, including the phone's hotspot AP interface) → connect over the
+    network so USB can be unplugged. Wireless debugging only binds the phone's
+    wifi-client interface and is 'unavailable' while the phone is a hotspot, so
+    this tcpip route is the only cordless option in hotspot mode. tcpip mode
+    resets when the phone reboots — rerun then. Returns (target|None, message)."""
+    usb, _ = _connected_devices()
+    if not usb:
+        return None, "No USB device — plug the phone in first."
+    dev = usb[0]
+    run([ADB, "-s", dev, "tcpip", "5555"], timeout=15)
+    time.sleep(1.5)
+    cands = []
+    rc, out = run([ADB, "-s", dev, "shell", "ip", "-o", "-4", "addr",
+                   "show", "scope", "global"], timeout=10)
+    for m in re.finditer(r"inet (\d{1,3}(?:\.\d{1,3}){3})", out):
+        if m.group(1) not in cands:
+            cands.append(m.group(1))
+    for gw in _pc_gateways():
+        if gw not in cands:
+            cands.append(gw)
+    for ip in cands:
+        tgt = f"{ip}:5555"
+        if "connected" in run([ADB, "connect", tgt], timeout=10)[1]:
+            return tgt, f"Wi-Fi connected: {tgt} — USB can be unplugged."
+    return None, "Enabled tcpip but couldn't reach the phone over the network."
+
+
 def _adb_mdns(line):
     """True for an adb-over-network mDNS service line we can `adb connect` to.
     Covers wireless-debugging TLS (`_adb-tls-connect._tcp`) AND legacy tcpip
@@ -851,9 +891,27 @@ class PhoneDeck(QMainWindow):
                 self.connect_to(it.data(Qt.UserRole))
 
         lst.itemActivated.connect(lambda _: do_connect())
+
+        def wifi_over_usb():
+            self.status.showMessage("Enabling Wi-Fi over USB…")
+            QApplication.processEvents()
+            tgt, msg = enable_wifi_over_usb()
+            self.status.showMessage(msg, 8000)
+            if tgt:
+                dlg.accept()
+                self.connect_to(tgt)
+            else:
+                refresh()
+
+        note = QLabel("Wi-Fi over USB: enables cordless adb (works on a "
+                      "hotspot); redo after a phone reboot.")
+        note.setStyleSheet("color:#9aa4b2;")
+        note.setWordWrap(True)
+        v.addWidget(note)
         row = QHBoxLayout()
         rb = QPushButton("Refresh"); rb.clicked.connect(refresh)
-        row.addWidget(rb); row.addStretch(1)
+        wb = QPushButton("Wi-Fi over USB"); wb.clicked.connect(wifi_over_usb)
+        row.addWidget(rb); row.addWidget(wb); row.addStretch(1)
         cb = QPushButton("Connect"); cb.clicked.connect(do_connect)
         xb = QPushButton("Cancel"); xb.clicked.connect(dlg.reject)
         row.addWidget(cb); row.addWidget(xb)
