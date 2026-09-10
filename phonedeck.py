@@ -95,6 +95,8 @@ SETTING_DEFAULTS = {
     "scroll_natural": True,        # wheel up scrolls content up
     "show_data_usage": False,      # nerd data: live mobile-data readout
     "show_charge": False,          # nerd data: charge status + watts
+    "max_fps": 0,                  # scrcpy --max-fps (0 = uncapped)
+    "bitrate_mbps": 8,             # scrcpy --video-bit-rate, in Mbps
 }
 
 
@@ -713,13 +715,18 @@ class ScrcpyEmbed(QWidget):
         else:
             res_str, dpi = cfg_get("res_landscape"), cfg_get("dpi_landscape", int)
         res = f"{res_str}/{dpi}"
+        args = [SCRCPY, "-s", self.target,
+                f"--new-display={res}",
+                "--keyboard=sdk", "--raw-key-events", "--mouse=sdk",
+                "--display-ime-policy=hide",   # no on-screen keyboard (PC types)
+                "--window-borderless", f"--window-title={EMBED_TITLE}",
+                f"--video-bit-rate={cfg_get('bitrate_mbps', int)}M",
+                "--no-audio"]
+        fps = cfg_get("max_fps", int)
+        if fps > 0:
+            args.append(f"--max-fps={fps}")
         self.proc = subprocess.Popen(
-            [SCRCPY, "-s", self.target,
-             f"--new-display={res}",
-             "--keyboard=sdk", "--raw-key-events", "--mouse=sdk",
-             "--display-ime-policy=hide",   # no on-screen keyboard (PC types)
-             "--window-borderless", f"--window-title={EMBED_TITLE}",
-             "--no-audio"],
+            args,
             stdout=self._log, stderr=subprocess.STDOUT,
             creationflags=CREATE_NO_WINDOW,
         )
@@ -845,10 +852,8 @@ class PhoneDeck(QMainWindow):
         conn_btn = QToolButton()
         conn_btn.setText("Connections")
         conn_btn.setPopupMode(QToolButton.InstantPopup)
-        nm = QMenu(self)
-        nm.addAction("Refresh apps", self.load_apps)
-        nm.addAction("Reconnect", self.reconnect)
-        nm.addAction("Device search…", self.device_search)
+        self._conn_menu = nm = QMenu(self)
+        nm.aboutToShow.connect(self._rebuild_connections)
         conn_btn.setMenu(nm)
         tl.addWidget(conn_btn)
         ctl_btn = QToolButton()
@@ -1035,6 +1040,40 @@ class PhoneDeck(QMainWindow):
         # connect to a specific device chosen from Device search
         run([ADB, "connect", target], timeout=10)
         self._connected(target)
+
+    # -- recent devices (quick switcher) --
+    def _recent_list(self):
+        try:
+            return json.loads(cfg().value("recent_devices", "[]"))
+        except Exception:
+            return []
+
+    def _recent_add(self, target):
+        """Record target (with its model name) at the top of the recents list."""
+        rc, out = run([ADB, "-s", target, "shell", "getprop", "ro.product.model"],
+                      timeout=8)
+        name = out.strip() or target
+        recents = [d for d in self._recent_list() if d.get("target") != target]
+        recents.insert(0, {"name": name, "target": target})
+        cfg().setValue("recent_devices", json.dumps(recents[:6]))
+
+    def _rebuild_connections(self):
+        """Populate the Connections menu: actions + recent devices to switch to."""
+        m = self._conn_menu
+        m.clear()
+        m.addAction("Refresh apps", self.load_apps)
+        m.addAction("Reconnect", self.reconnect)
+        m.addAction("Device search…", self.device_search)
+        recents = self._recent_list()
+        if recents:
+            m.addSeparator()
+            hdr = m.addAction("Recent devices")
+            hdr.setEnabled(False)
+            for d in recents:
+                tgt, name = d.get("target"), d.get("name", "")
+                mark = "● " if tgt == self.target else "   "
+                act = m.addAction(f"{mark}{name}   ({tgt})")
+                act.triggered.connect(lambda _=False, t=tgt: self.connect_to(t))
 
     def _refresh_controls(self):
         """Tick each control to the phone's current state before the menu shows."""
@@ -1251,6 +1290,14 @@ class PhoneDeck(QMainWindow):
         form.addRow("Resolution", pt_res)
         form.addRow("Density (dpi)", pt_dpi)
 
+        fps = QSpinBox(); fps.setRange(0, 120); fps.setSingleStep(5)
+        fps.setSpecialValueText("Uncapped"); fps.setValue(cfg_get("max_fps", int))
+        bitrate = QSpinBox(); bitrate.setRange(1, 50); bitrate.setSuffix(" Mbps")
+        bitrate.setValue(cfg_get("bitrate_mbps", int))
+        form.addRow(_section("Streaming"))
+        form.addRow("Max FPS", fps)
+        form.addRow("Bitrate", bitrate)
+
         scroll = QSpinBox(); scroll.setRange(60, 800); scroll.setSingleStep(20)
         scroll.setSuffix(" px"); scroll.setValue(cfg_get("scroll_dist", int))
         natural = QCheckBox("Natural (wheel up scrolls up)")
@@ -1276,20 +1323,24 @@ class PhoneDeck(QMainWindow):
         form.addRow(bb)
         if dlg.exec() == QDialog.Accepted:
             portrait = cfg().value("portrait", False, type=bool)
-            old = (cfg_get("res_portrait" if portrait else "res_landscape"),
-                   cfg_get("dpi_portrait" if portrait else "dpi_landscape", int))
+            reskey = "res_portrait" if portrait else "res_landscape"
+            dpikey = "dpi_portrait" if portrait else "dpi_landscape"
+            old = (cfg_get(reskey), cfg_get(dpikey, int),
+                   cfg_get("max_fps", int), cfg_get("bitrate_mbps", int))
             c = cfg()
             c.setValue("res_landscape", ls_res.currentText())
             c.setValue("dpi_landscape", ls_dpi.value())
             c.setValue("res_portrait", pt_res.currentText())
             c.setValue("dpi_portrait", pt_dpi.value())
+            c.setValue("max_fps", fps.value())
+            c.setValue("bitrate_mbps", bitrate.value())
             c.setValue("scroll_dist", scroll.value())
             c.setValue("scroll_natural", natural.isChecked())
             c.setValue("show_data_usage", data_usage.isChecked())
             c.setValue("show_charge", charge.isChecked())
             self._sync_data_monitor()
-            new = (cfg_get("res_portrait" if portrait else "res_landscape"),
-                   cfg_get("dpi_portrait" if portrait else "dpi_landscape", int))
+            new = (cfg_get(reskey), cfg_get(dpikey, int),
+                   cfg_get("max_fps", int), cfg_get("bitrate_mbps", int))
             if self.target and new != old:
                 self.embed.start(self.target)   # restart display at new size
 
@@ -1301,6 +1352,7 @@ class PhoneDeck(QMainWindow):
             QTimer.singleShot(300, self.device_search)   # first-run / no device
             return
         QSettings("PhoneDeck", "PhoneDeck").setValue("last_target", target)
+        self._recent_add(target)
         self.status.showMessage(f"Connected  ({target})")
         self.embed.start(target)
         self.load_apps()
