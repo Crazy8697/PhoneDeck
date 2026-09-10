@@ -17,12 +17,15 @@ import os
 import queue
 import re
 import subprocess
+import collections
 import sys
 import threading
 import time
 
-from PySide6.QtCore import Qt, QTimer, QThread, Signal, QSettings, QEvent
-from PySide6.QtGui import QFont, QColor, QCursor, QIcon
+from PySide6.QtCore import (Qt, QTimer, QThread, Signal, QSettings, QEvent,
+                            QPointF, QSize)
+from PySide6.QtGui import (QFont, QColor, QCursor, QIcon, QPixmap, QPainter,
+                           QPen, QBrush, QPolygonF)
 from PySide6.QtWidgets import (
     QApplication, QWidget, QMainWindow, QHBoxLayout, QVBoxLayout, QLineEdit,
     QListWidget, QListWidgetItem, QPushButton, QLabel, QFrame, QMenu,
@@ -176,6 +179,30 @@ def enable_wifi_over_usb():
     return None, "Enabled tcpip but couldn't reach the phone over the network."
 
 
+def pair_device(addr, code):
+    """`adb pair <ip:port> <code>` for wireless-debugging pairing. Returns
+    (ok, message)."""
+    rc, out = run([ADB, "pair", addr, code], timeout=25)
+    ok = "Successfully paired" in out
+    line = out.strip().splitlines()[-1] if out.strip() else (
+        "paired" if ok else "pair failed")
+    return ok, line
+
+
+def find_connect_after_pair(ip, tries=8):
+    """After pairing, the device advertises its (different) connect port over
+    mDNS. Poll for it and connect. Returns the connected target or None."""
+    for _ in range(tries):
+        rc, out = run([ADB, "mdns", "services"], timeout=8)
+        for line in out.splitlines():
+            if _adb_mdns(line) and ip in line:
+                m = re.search(r"(\d{1,3}(?:\.\d{1,3}){3}:\d+)", line)
+                if m and "connected" in run([ADB, "connect", m.group(1)])[1]:
+                    return m.group(1)
+        time.sleep(1.5)
+    return None
+
+
 def _setting(target, scope, key):
     """Read `settings get <scope> <key>` as a stripped string ('' if unset)."""
     rc, out = run([ADB, "-s", target, "shell", "settings", "get", scope, key],
@@ -250,6 +277,56 @@ def _section(text):
     lbl = QLabel(text)
     lbl.setStyleSheet("color:#8aa0c0; font-weight:600; margin-top:6px;")
     return lbl
+
+
+_ICON_CACHE = {}
+_TILE_COLORS = ["#4f7cff", "#e0568a", "#2fae7a", "#e0913a", "#8a6ff0",
+                "#3aa8c0", "#c0553a", "#6a8a2f", "#c04ab0", "#3a7ac0"]
+
+
+def letter_icon(label, pkg):
+    """A colored rounded tile with the app's initial — a lightweight sidebar
+    icon (real launcher-icon extraction over adb isn't practical). Color is
+    stable per package; cached."""
+    ch = next((c for c in label.strip() if c.isalnum()), "?").upper()
+    color = _TILE_COLORS[hash(pkg) % len(_TILE_COLORS)]
+    key = (ch, color)
+    if key in _ICON_CACHE:
+        return _ICON_CACHE[key]
+    n = 40
+    pm = QPixmap(n, n); pm.fill(Qt.transparent)
+    p = QPainter(pm)
+    p.setRenderHint(QPainter.Antialiasing)
+    p.setBrush(QBrush(QColor(color))); p.setPen(Qt.NoPen)
+    p.drawRoundedRect(2, 2, n - 4, n - 4, 9, 9)
+    p.setPen(QColor("#ffffff"))
+    f = QFont(); f.setPointSize(15); f.setBold(True); p.setFont(f)
+    p.drawText(pm.rect(), Qt.AlignCenter, ch)
+    p.end()
+    icon = QIcon(pm)
+    _ICON_CACHE[key] = icon
+    return icon
+
+
+def make_sparkline(values, w, h, color):
+    """A tiny sparkline QPixmap of the recent values (auto-scaled)."""
+    pm = QPixmap(w, h); pm.fill(Qt.transparent)
+    if len(values) < 2:
+        return pm
+    lo, hi = min(values), max(values)
+    span = (hi - lo) or 1.0
+    p = QPainter(pm)
+    p.setRenderHint(QPainter.Antialiasing)
+    p.setPen(QPen(QColor(color), 1.4))
+    poly = QPolygonF()
+    n = len(values)
+    for i, v in enumerate(values):
+        x = i * (w - 2) / (n - 1) + 1
+        y = h - 2 - (v - lo) / span * (h - 4)
+        poly.append(QPointF(x, y))
+    p.drawPolyline(poly)
+    p.end()
+    return pm
 
 
 def dim_active(target):
@@ -897,6 +974,7 @@ class PhoneDeck(QMainWindow):
         sl.addWidget(self.search)
         self.favorites = load_favorites()
         self.applist = QListWidget()
+        self.applist.setIconSize(QSize(24, 24))
         self.applist.itemActivated.connect(self.launch_selected)
         self.applist.itemClicked.connect(self.launch_selected)
         self.applist.setContextMenuPolicy(Qt.CustomContextMenu)
@@ -925,9 +1003,15 @@ class PhoneDeck(QMainWindow):
         self._charge_lbl = QLabel("")
         self._charge_lbl.setStyleSheet("color:#9aa4b2; padding:0 6px;")
         self.status.addPermanentWidget(self._charge_lbl)
+        self._charge_spark = QLabel("")
+        self.status.addPermanentWidget(self._charge_spark)
         self._data_lbl = QLabel("")
         self._data_lbl.setStyleSheet("color:#9aa4b2; padding:0 6px;")
         self.status.addPermanentWidget(self._data_lbl)
+        self._data_spark = QLabel("")
+        self.status.addPermanentWidget(self._data_spark)
+        self._charge_hist = collections.deque(maxlen=40)
+        self._rate_hist = collections.deque(maxlen=40)
         self._data_base = None          # (rx, tx) baseline for this session
         self._data_last = None          # (rx, tx, monotonic) for rate calc
         self._data_timer = QTimer(self)
@@ -1133,21 +1217,25 @@ class PhoneDeck(QMainWindow):
             self._tick_nerd_data()
         elif not want and self._data_timer.isActive():
             self._data_timer.stop()
-            self._data_lbl.setText("")
-            self._charge_lbl.setText("")
+            self._clear_nerd_labels()
+
+    def _clear_nerd_labels(self):
+        for w in (self._data_lbl, self._charge_lbl,
+                  self._data_spark, self._charge_spark):
+            w.clear()
 
     def _tick_nerd_data(self):
         if not self.target:
-            self._data_lbl.setText(""); self._charge_lbl.setText("")
+            self._clear_nerd_labels()
             return
         if cfg_get("show_charge", bool):
             self._update_charge()
         else:
-            self._charge_lbl.setText("")
+            self._charge_lbl.clear(); self._charge_spark.clear()
         if cfg_get("show_data_usage", bool):
             self._update_data_usage()
         else:
-            self._data_lbl.setText("")
+            self._data_lbl.clear(); self._data_spark.clear()
 
     def _update_charge(self):
         c = charge_info(self.target)
@@ -1161,6 +1249,10 @@ class PhoneDeck(QMainWindow):
             self._charge_lbl.setText(f"🔋 -{c['watts']:.1f} W  {lvl_s}")
         else:
             self._charge_lbl.setText(f"🔋 {lvl_s}")
+        if c["watts"] is not None:
+            self._charge_hist.append(c["watts"])
+            self._charge_spark.setPixmap(
+                make_sparkline(list(self._charge_hist), 48, 16, "#e0913a"))
 
     def _update_data_usage(self):
         rx, tx = mobile_bytes(self.target)
@@ -1178,6 +1270,9 @@ class PhoneDeck(QMainWindow):
             if dt > 0:
                 dn, up = max(0, rx - prx) / dt, max(0, tx - ptx) / dt
                 rate = f"  ↓{fmt_bytes(dn)}/s ↑{fmt_bytes(up)}/s"
+                self._rate_hist.append(dn + up)
+                self._data_spark.setPixmap(
+                    make_sparkline(list(self._rate_hist), 48, 16, "#3aa8c0"))
         self._data_last = (rx, tx, now)
         teth = "📡 " if tethering_active(self.target) else "📶 "
         self._data_lbl.setText(
@@ -1257,11 +1352,51 @@ class PhoneDeck(QMainWindow):
         row = QHBoxLayout()
         rb = QPushButton("Refresh"); rb.clicked.connect(refresh)
         wb = QPushButton("Wi-Fi over USB"); wb.clicked.connect(wifi_over_usb)
-        row.addWidget(rb); row.addWidget(wb); row.addStretch(1)
+        pb = QPushButton("Pair new…")
+        pb.clicked.connect(lambda: (dlg.accept(), self.pair_dialog()))
+        row.addWidget(rb); row.addWidget(wb); row.addWidget(pb); row.addStretch(1)
         cb = QPushButton("Connect"); cb.clicked.connect(do_connect)
         xb = QPushButton("Cancel"); xb.clicked.connect(dlg.reject)
         row.addWidget(cb); row.addWidget(xb)
         v.addLayout(row)
+        dlg.exec()
+
+    def pair_dialog(self):
+        dlg = QDialog(self)
+        dlg.setWindowTitle("Pair wireless device")
+        form = QFormLayout(dlg)
+        info = QLabel("On the phone: Developer options → Wireless debugging → "
+                      "Pair device with pairing code. Enter the address and "
+                      "code it shows.")
+        info.setWordWrap(True); form.addRow(info)
+        addr = QLineEdit(); addr.setPlaceholderText("192.168.x.x:37xxx")
+        code = QLineEdit(); code.setPlaceholderText("6-digit code")
+        form.addRow("Pairing IP:port", addr)
+        form.addRow("Code", code)
+        st = QLabel(""); st.setStyleSheet("color:#9aa4b2;"); st.setWordWrap(True)
+        form.addRow(st)
+
+        def do_pair():
+            a, c = addr.text().strip(), code.text().strip()
+            if not a or not c:
+                st.setText("Enter both the address and the code."); return
+            st.setText("Pairing…"); QApplication.processEvents()
+            ok, msg = pair_device(a, c)
+            if not ok:
+                st.setText(msg); return
+            st.setText(msg + "  Finding device…"); QApplication.processEvents()
+            tgt = find_connect_after_pair(a.split(":")[0])
+            if tgt:
+                dlg.accept(); self.connect_to(tgt)
+            else:
+                st.setText(msg + "  Paired — open Device search to connect.")
+
+        row = QHBoxLayout()
+        pair_btn = QPushButton("Pair"); pair_btn.clicked.connect(do_pair)
+        close_btn = QPushButton("Close"); close_btn.clicked.connect(dlg.reject)
+        row.addStretch(1); row.addWidget(pair_btn); row.addWidget(close_btn)
+        form.addRow(row)
+        dlg.setMinimumWidth(360)
         dlg.exec()
 
     def open_settings(self):
@@ -1363,6 +1498,10 @@ class PhoneDeck(QMainWindow):
         self.status.showMessage(f"Connected  ({self.target})")
         self.kb.start(self.target, did)
         self.wheel.install()
+        pend = getattr(self, "_pending_launch", None)
+        if pend:
+            self._pending_launch = None
+            QTimer.singleShot(150, lambda p=pend: self._launch_now(p))
 
     # -- apps --
     def load_apps(self):
@@ -1379,6 +1518,23 @@ class PhoneDeck(QMainWindow):
         if self.target:
             self.status.showMessage(f"Connected  ({self.target})")
 
+    # -- per-app launch profiles (preferred orientation) --
+    def _profiles(self):
+        try:
+            return json.loads(cfg().value("app_profiles", "{}"))
+        except Exception:
+            return {}
+
+    def _set_profile(self, pkg, orientation):
+        """orientation: 'portrait', 'landscape', or None to clear."""
+        profs = self._profiles()
+        if orientation:
+            profs[pkg] = orientation
+        else:
+            profs.pop(pkg, None)
+        cfg().setValue("app_profiles", json.dumps(profs))
+        self.filter_apps(self.search.text())
+
     def _add_header(self, text):
         it = QListWidgetItem(text)
         it.setFlags(Qt.NoItemFlags)          # non-selectable divider
@@ -1389,8 +1545,11 @@ class PhoneDeck(QMainWindow):
 
     def _add_app(self, label, pkg):
         star = "★ " if pkg in self.favorites else ""
-        it = QListWidgetItem(star + label)
+        it = QListWidgetItem(letter_icon(label, pkg), star + label)
         it.setData(Qt.UserRole, pkg)
+        prof = self._profiles().get(pkg)
+        if prof:
+            it.setToolTip(f"Launches in {prof}")
         self.applist.addItem(it)
 
     def filter_apps(self, text):
@@ -1417,15 +1576,28 @@ class PhoneDeck(QMainWindow):
             return
         menu = QMenu(self)
         fav = pkg in self.favorites
-        act = menu.addAction("Remove from Favorites" if fav
-                             else "Add to Favorites")
-        if menu.exec(self.applist.mapToGlobal(pos)) == act:
+        fav_act = menu.addAction("Remove from Favorites" if fav
+                                 else "Add to Favorites")
+        menu.addSeparator()
+        prof = self._profiles().get(pkg)
+        sub = menu.addMenu("Launch orientation")
+        a_def = sub.addAction("Default (current)")
+        a_land = sub.addAction("Landscape")
+        a_port = sub.addAction("Portrait")
+        for a, val in ((a_def, None), (a_land, "landscape"), (a_port, "portrait")):
+            a.setCheckable(True)
+            a.setChecked(prof == val)
+        chosen = menu.exec(self.applist.mapToGlobal(pos))
+        if chosen == fav_act:
             if fav:
                 self.favorites.discard(pkg)
             else:
                 self.favorites.add(pkg)
             save_favorites(self.favorites)
             self.filter_apps(self.search.text())
+        elif chosen in (a_def, a_land, a_port):
+            self._set_profile(pkg, {a_def: None, a_land: "landscape",
+                                    a_port: "portrait"}[chosen])
 
     def launch_selected(self, item):
         if not item or not self.target:
@@ -1433,6 +1605,20 @@ class PhoneDeck(QMainWindow):
         pkg = item.data(Qt.UserRole)
         if not pkg:                          # header row
             return
+        # per-app profile: switch orientation first, then launch once the
+        # new display is ready (handled in _display_ready via _pending_launch)
+        prof = self._profiles().get(pkg)
+        if prof:
+            want_portrait = (prof == "portrait")
+            if cfg().value("portrait", False, type=bool) != want_portrait:
+                cfg().setValue("portrait", want_portrait)
+                self._pending_launch = pkg
+                self.status.showMessage(f"Switching to {prof}…")
+                self.embed.start(self.target)
+                return
+        self._launch_now(pkg)
+
+    def _launch_now(self, pkg):
         did = self.embed.display_id
         if did is None:
             # display not ready yet — fall back to phone screen
