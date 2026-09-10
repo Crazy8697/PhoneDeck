@@ -128,6 +128,16 @@ def _connected_devices():
     return usb, wl
 
 
+def _adb_mdns(line):
+    """True for an adb-over-network mDNS service line we can `adb connect` to.
+    Covers wireless-debugging TLS (`_adb-tls-connect._tcp`) AND legacy tcpip
+    (`_adb._tcp`, port 5555) — a phone acting as a hotspot advertises the
+    legacy service, so matching only the TLS one silently misses it. The
+    pairing service (`_adb-tls-pairing`) is NOT connectable, so exclude it."""
+    return ("_adb-tls-pairing" not in line
+            and ("_adb-tls-connect" in line or "_adb._tcp" in line))
+
+
 def resolve_target(prefer=None):
     """Find a device to connect to. Order: the preferred (last good) device,
     then any connected USB device, then any connected wireless device, then
@@ -152,7 +162,7 @@ def resolve_target(prefer=None):
     for _ in range(10):
         rc, out = run([ADB, "mdns", "services"], timeout=10)
         for line in out.splitlines():
-            if "_adb-tls-connect" in line:
+            if _adb_mdns(line):
                 m = re.search(r"(\d{1,3}(?:\.\d{1,3}){3}:\d+)", line)
                 if m and "connected" in run([ADB, "connect", m.group(1)])[1]:
                     return m.group(1)
@@ -223,7 +233,7 @@ def list_devices():
             devices.append((f"{t}   ({kind}, connected)", t))
     rc, o = run([ADB, "mdns", "services"], timeout=8)
     for line in o.splitlines():
-        if "_adb-tls-connect" in line:
+        if _adb_mdns(line):
             m = re.search(r"(\d{1,3}(?:\.\d{1,3}){3}:\d+)", line)
             if m and m.group(1) not in seen:
                 seen.add(m.group(1))
