@@ -98,6 +98,7 @@ SETTING_DEFAULTS = {
     "scroll_natural": True,        # wheel up scrolls content up
     "show_data_usage": False,      # nerd data: live mobile-data readout
     "show_charge": False,          # nerd data: charge status + watts
+    "show_temp": False,            # nerd data: battery temperature
     "max_fps": 0,                  # scrcpy --max-fps (0 = uncapped)
     "bitrate_mbps": 8,             # scrcpy --video-bit-rate, in Mbps
 }
@@ -288,7 +289,7 @@ def charge_info(target):
     rc, out = run([ADB, "-s", target, "shell", "dumpsys", "battery"], timeout=8)
     d = {}
     for line in out.splitlines():
-        m = re.match(r"\s*(status|level|voltage):\s*(-?\d+)\s*$", line)
+        m = re.match(r"\s*(status|level|voltage|temperature):\s*(-?\d+)\s*$", line)
         if m:
             d[m.group(1)] = int(m.group(2))
     rc, cur = run([ADB, "-s", target, "shell", "cat",
@@ -299,8 +300,9 @@ def charge_info(target):
         amps = None
     volts = d.get("voltage", 0) / 1000.0       # mV -> V
     watts = abs(amps) * volts if (amps is not None and volts) else None
+    temp = d["temperature"] / 10.0 if "temperature" in d else None  # dC -> C
     return {"status": d.get("status"), "level": d.get("level"),
-            "watts": watts, "amps": amps}
+            "watts": watts, "amps": amps, "temp_c": temp}
 
 
 def _section(text):
@@ -1035,6 +1037,9 @@ class PhoneDeck(QMainWindow):
 
         self.status = self.statusBar()
         self.status.showMessage("Connecting…")
+        self._temp_lbl = QLabel("")
+        self._temp_lbl.setStyleSheet("color:#9aa4b2; padding:0 6px;")
+        self.status.addPermanentWidget(self._temp_lbl)
         self._charge_lbl = QLabel("")
         self._charge_lbl.setStyleSheet("color:#9aa4b2; padding:0 6px;")
         self.status.addPermanentWidget(self._charge_lbl)
@@ -1245,7 +1250,8 @@ class PhoneDeck(QMainWindow):
     def _sync_data_monitor(self):
         """Start/stop the nerd-data timer to match the settings + connection."""
         want = bool(self.target) and (cfg_get("show_data_usage", bool)
-                                      or cfg_get("show_charge", bool))
+                                      or cfg_get("show_charge", bool)
+                                      or cfg_get("show_temp", bool))
         if want and not self._data_timer.isActive():
             self._data_base = None
             self._data_timer.start()
@@ -1255,7 +1261,7 @@ class PhoneDeck(QMainWindow):
             self._clear_nerd_labels()
 
     def _clear_nerd_labels(self):
-        for w in (self._data_lbl, self._charge_lbl,
+        for w in (self._data_lbl, self._charge_lbl, self._temp_lbl,
                   self._data_spark, self._charge_spark):
             w.clear()
 
@@ -1263,6 +1269,10 @@ class PhoneDeck(QMainWindow):
         if not self.target:
             self._clear_nerd_labels()
             return
+        if cfg_get("show_temp", bool):
+            self._update_temp()
+        else:
+            self._temp_lbl.clear()
         if cfg_get("show_charge", bool):
             self._update_charge()
         else:
@@ -1271,6 +1281,10 @@ class PhoneDeck(QMainWindow):
             self._update_data_usage()
         else:
             self._data_lbl.clear(); self._data_spark.clear()
+
+    def _update_temp(self):
+        t = charge_info(self.target).get("temp_c")
+        self._temp_lbl.setText(f"🌡 {t:.1f}°C" if t is not None else "")
 
     def _update_charge(self):
         c = charge_info(self.target)
@@ -1480,9 +1494,12 @@ class PhoneDeck(QMainWindow):
         data_usage.setChecked(cfg_get("show_data_usage", bool))
         charge = QCheckBox("Show charge rate (watts + battery %)")
         charge.setChecked(cfg_get("show_charge", bool))
+        temp = QCheckBox("Show battery temperature")
+        temp.setChecked(cfg_get("show_temp", bool))
         form.addRow(_section("Nerd data"))
         form.addRow("", data_usage)
         form.addRow("", charge)
+        form.addRow("", temp)
         note = QLabel("Resolution/density applies to the matching orientation "
                       "and reconnects the display when it changes.")
         note.setStyleSheet("color:#9aa4b2;")
@@ -1508,6 +1525,7 @@ class PhoneDeck(QMainWindow):
             c.setValue("scroll_natural", natural.isChecked())
             c.setValue("show_data_usage", data_usage.isChecked())
             c.setValue("show_charge", charge.isChecked())
+            c.setValue("show_temp", temp.isChecked())
             self._sync_data_monitor()
             new = (cfg_get(reskey), cfg_get(dpikey, int),
                    cfg_get("max_fps", int), cfg_get("bitrate_mbps", int))
