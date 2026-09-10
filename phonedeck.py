@@ -168,6 +168,40 @@ def enable_wifi_over_usb():
     return None, "Enabled tcpip but couldn't reach the phone over the network."
 
 
+def _setting(target, scope, key):
+    """Read `settings get <scope> <key>` as a stripped string ('' if unset)."""
+    rc, out = run([ADB, "-s", target, "shell", "settings", "get", scope, key],
+                  timeout=8)
+    out = out.strip()
+    return "" if out in ("null", "None") else out
+
+
+# Phone controls doable over adb WITHOUT root. Each: key -> dict(label, get, on,
+# off). `get(target)` returns current bool; `on`/`off` are shell arg lists run
+# as `adb -s <t> shell <args...>`. Hotspot/USB-tethering aren't here — Android
+# gates softap/tether toggles behind root (shell hits a SecurityException); the
+# Controls menu instead opens the phone's Tethering settings for those.
+PHONE_CONTROLS = [
+    ("wifi", "Wi-Fi",
+     lambda t: _setting(t, "global", "wifi_on") == "1",
+     ["svc", "wifi", "enable"], ["svc", "wifi", "disable"]),
+    ("data", "Mobile data",
+     lambda t: _setting(t, "global", "mobile_data") == "1",
+     ["svc", "data", "enable"], ["svc", "data", "disable"]),
+    ("airplane", "Airplane mode",
+     lambda t: _setting(t, "global", "airplane_mode_on") == "1",
+     ["cmd", "connectivity", "airplane-mode", "enable"],
+     ["cmd", "connectivity", "airplane-mode", "disable"]),
+    ("stayawake", "Stay awake while charging",
+     lambda t: _setting(t, "global", "stay_on_while_plugged_in") not in ("", "0"),
+     ["svc", "power", "stayon", "true"], ["svc", "power", "stayon", "false"]),
+    ("taps", "Show taps",
+     lambda t: _setting(t, "system", "show_touches") == "1",
+     ["settings", "put", "system", "show_touches", "1"],
+     ["settings", "put", "system", "show_touches", "0"]),
+]
+
+
 def _adb_mdns(line):
     """True for an adb-over-network mDNS service line we can `adb connect` to.
     Covers wireless-debugging TLS (`_adb-tls-connect._tcp`) AND legacy tcpip
@@ -716,6 +750,22 @@ class PhoneDeck(QMainWindow):
         fm.addAction("Settings…", self.open_settings)
         file_btn.setMenu(fm)
         tl.addWidget(file_btn)
+        ctl_btn = QToolButton()
+        ctl_btn.setText("Controls")
+        ctl_btn.setPopupMode(QToolButton.InstantPopup)
+        self._ctl_menu = cm = QMenu(self)
+        self._ctl_actions = {}
+        for key, label, getf, on_cmd, off_cmd in PHONE_CONTROLS:
+            act = cm.addAction(label)
+            act.setCheckable(True)
+            act.triggered.connect(
+                lambda checked, o=on_cmd, f=off_cmd: self._control_toggle(o, f))
+            self._ctl_actions[key] = (act, getf)
+        cm.addSeparator()
+        cm.addAction("Tethering & hotspot settings…", self._open_tether_settings)
+        cm.aboutToShow.connect(self._refresh_controls)
+        ctl_btn.setMenu(cm)
+        tl.addWidget(ctl_btn)
         tl.addStretch(1)
         outer.addWidget(topbar)
 
@@ -870,6 +920,42 @@ class PhoneDeck(QMainWindow):
         # connect to a specific device chosen from Device search
         run([ADB, "connect", target], timeout=10)
         self._connected(target)
+
+    def _refresh_controls(self):
+        """Tick each control to the phone's current state before the menu shows."""
+        if not self.target:
+            for act, _ in self._ctl_actions.values():
+                act.setEnabled(False)
+            return
+        for act, getf in self._ctl_actions.values():
+            act.setEnabled(True)
+            try:
+                act.setChecked(bool(getf(self.target)))
+            except Exception:
+                pass
+
+    def _control_toggle(self, on_cmd, off_cmd):
+        if not self.target:
+            self.status.showMessage("No device connected", 4000)
+            return
+        act = self.sender()
+        cmd = on_cmd if (act and act.isChecked()) else off_cmd
+        rc, out = run([ADB, "-s", self.target, "shell", *cmd], timeout=12)
+        msg = out.strip().splitlines()[-1] if out.strip() else ""
+        if rc == 0 and "Exception" not in msg and "denied" not in msg.lower():
+            self.status.showMessage(f"{' '.join(cmd)} ✓", 4000)
+        else:
+            self.status.showMessage(f"Failed: {msg or 'see phone'}", 6000)
+
+    def _open_tether_settings(self):
+        """Open the phone's Hotspot & tethering screen (softap/USB-tether can't
+        be toggled over adb without root — user flips them there)."""
+        if not self.target:
+            self.status.showMessage("No device connected", 4000)
+            return
+        run([ADB, "-s", self.target, "shell", "am", "start", "-a",
+             "android.settings.TETHER_SETTINGS"], timeout=10)
+        self.status.showMessage("Opened Tethering settings on the phone", 5000)
 
     def device_search(self):
         dlg = QDialog(self)
