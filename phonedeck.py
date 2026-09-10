@@ -84,11 +84,16 @@ _SCRCPY_VDISP_RE = re.compile(
 CREATE_NO_WINDOW = 0x08000000      # keep adb/scrcpy console windows hidden
 
 # user settings (persisted via QSettings), with defaults
+VERSION = "1.2.0"
+
 SETTING_DEFAULTS = {
-    "resolution": "1920x1080",  # virtual display W x H
-    "dpi": 180,                 # virtual display density
-    "scroll_dist": 260,         # px of swipe per wheel tick
-    "scroll_natural": True,     # wheel up scrolls content up
+    "res_landscape": "1920x1080",  # virtual display W x H, landscape
+    "dpi_landscape": 180,
+    "res_portrait": "1080x1920",   # virtual display W x H, portrait
+    "dpi_portrait": 180,
+    "scroll_dist": 260,            # px of swipe per wheel tick
+    "scroll_natural": True,        # wheel up scrolls content up
+    "show_data_usage": False,      # live mobile-data readout (for tethering)
 }
 
 
@@ -174,6 +179,52 @@ def _setting(target, scope, key):
                   timeout=8)
     out = out.strip()
     return "" if out in ("null", "None") else out
+
+
+def mobile_bytes(target):
+    """Total cellular (rmnet*) RX+TX bytes since boot, as (rx, tx). Mobile data
+    rides the rmnet interfaces; summing them tracks cellular usage (what gets
+    burned while tethering). Returns (None, None) if unreadable."""
+    rc, out = run([ADB, "-s", target, "shell", "cat", "/proc/net/dev"], timeout=8)
+    rx = tx = 0
+    found = False
+    for line in out.splitlines():
+        line = line.strip()
+        if not line.startswith("rmnet"):
+            continue
+        parts = line.split(":", 1)
+        if len(parts) != 2:
+            continue
+        cols = parts[1].split()
+        if len(cols) >= 9:
+            try:
+                rx += int(cols[0]); tx += int(cols[8]); found = True
+            except ValueError:
+                pass
+    return (rx, tx) if found else (None, None)
+
+
+def tethering_active(target):
+    """True if the phone is currently sharing its connection (USB/Wi-Fi/BT):
+    a tethered downstream interface (rndis0 usb, ap0/wlan1 softap, bt-pan) has
+    an IPv4 address assigned."""
+    rc, out = run([ADB, "-s", target, "shell", "ip", "-o", "-4", "addr"], timeout=8)
+    return bool(re.search(r"\b(rndis\d+|ap\d+|bt-pan|swlan\d+)\b.*inet ", out))
+
+
+def fmt_bytes(n):
+    """Human-readable byte count."""
+    for unit in ("B", "KB", "MB", "GB", "TB"):
+        if n < 1024 or unit == "TB":
+            return f"{n:.0f} {unit}" if unit == "B" else f"{n:.1f} {unit}"
+        n /= 1024
+
+
+def _section(text):
+    """A small section-header label for form layouts."""
+    lbl = QLabel(text)
+    lbl.setStyleSheet("color:#8aa0c0; font-weight:600; margin-top:6px;")
+    return lbl
 
 
 def dim_active(target):
@@ -634,10 +685,11 @@ class ScrcpyEmbed(QWidget):
         # instance's phone-side server is still clearing — retried by _detect.
         self._start_tries += 1
         self._log = open(SCRCPY_LOG, "w", encoding="utf-8", errors="replace")
-        w, h = cfg_get("resolution").split("x")
         if cfg().value("portrait", False, type=bool):
-            w, h = h, w                          # swap for portrait
-        res = f"{w}x{h}/{cfg_get('dpi', int)}"
+            res_str, dpi = cfg_get("res_portrait"), cfg_get("dpi_portrait", int)
+        else:
+            res_str, dpi = cfg_get("res_landscape"), cfg_get("dpi_landscape", int)
+        res = f"{res_str}/{dpi}"
         self.proc = subprocess.Popen(
             [SCRCPY, "-s", self.target,
              f"--new-display={res}",
@@ -763,13 +815,19 @@ class PhoneDeck(QMainWindow):
         file_btn.setText("File")
         file_btn.setPopupMode(QToolButton.InstantPopup)
         fm = QMenu(self)
-        fm.addAction("Refresh apps", self.load_apps)
-        fm.addAction("Reconnect", self.reconnect)
-        fm.addAction("Device search…", self.device_search)
-        fm.addSeparator()
         fm.addAction("Settings…", self.open_settings)
+        fm.addAction("About…", self.open_about)
         file_btn.setMenu(fm)
         tl.addWidget(file_btn)
+        conn_btn = QToolButton()
+        conn_btn.setText("Connections")
+        conn_btn.setPopupMode(QToolButton.InstantPopup)
+        nm = QMenu(self)
+        nm.addAction("Refresh apps", self.load_apps)
+        nm.addAction("Reconnect", self.reconnect)
+        nm.addAction("Device search…", self.device_search)
+        conn_btn.setMenu(nm)
+        tl.addWidget(conn_btn)
         ctl_btn = QToolButton()
         ctl_btn.setText("Controls")
         ctl_btn.setPopupMode(QToolButton.InstantPopup)
@@ -836,6 +894,13 @@ class PhoneDeck(QMainWindow):
 
         self.status = self.statusBar()
         self.status.showMessage("Connecting…")
+        self._data_lbl = QLabel("")
+        self._data_lbl.setStyleSheet("color:#9aa4b2; padding:0 6px;")
+        self.status.addPermanentWidget(self._data_lbl)
+        self._data_base = None          # (rx, tx) baseline for this session
+        self._data_timer = QTimer(self)
+        self._data_timer.setInterval(3000)
+        self._data_timer.timeout.connect(self._tick_data_usage)
 
         self._apply_theme()
         self._restore_geometry()
@@ -991,6 +1056,60 @@ class PhoneDeck(QMainWindow):
              "android.settings.TETHER_SETTINGS"], timeout=10)
         self.status.showMessage("Opened Tethering settings on the phone", 5000)
 
+    # -- mobile data usage readout (for tethering) --
+    def _sync_data_monitor(self):
+        """Start/stop the data-usage timer to match the setting + connection."""
+        want = cfg_get("show_data_usage", bool) and bool(self.target)
+        if want and not self._data_timer.isActive():
+            self._data_base = None
+            self._data_timer.start()
+            self._tick_data_usage()
+        elif not want and self._data_timer.isActive():
+            self._data_timer.stop()
+            self._data_lbl.setText("")
+
+    def _tick_data_usage(self):
+        if not self.target:
+            self._data_lbl.setText("")
+            return
+        rx, tx = mobile_bytes(self.target)
+        if rx is None:
+            self._data_lbl.setText("")
+            return
+        if self._data_base is None:
+            self._data_base = (rx, tx)
+        drx, dtx = rx - self._data_base[0], tx - self._data_base[1]
+        teth = "📡 " if tethering_active(self.target) else "📶 "
+        self._data_lbl.setText(
+            f"{teth}mobile ↓{fmt_bytes(max(0, drx))} ↑{fmt_bytes(max(0, dtx))}")
+
+    def open_about(self):
+        dlg = QDialog(self)
+        dlg.setWindowTitle("About PhoneDeck")
+        v = QVBoxLayout(dlg)
+        title = QLabel("PhoneDeck")
+        title.setStyleSheet("font-size:18px; font-weight:600;")
+        v.addWidget(title)
+        v.addWidget(QLabel(f"Version {VERSION}"))
+        body = QLabel(
+            "Runs your phone's apps in a window on the PC via scrcpy — a "
+            "searchable app launcher on the left and a virtual external "
+            "display on the right, so the phone's own screen stays free.\n\n"
+            "Connects over USB or Wi-Fi (incl. the phone's hotspot, via "
+            "Wi-Fi over USB). No root required.")
+        body.setWordWrap(True)
+        body.setStyleSheet("color:#c3c9d2;")
+        v.addWidget(body)
+        link = QLabel('<a href="https://github.com/Crazy8697/PhoneDeck" '
+                      'style="color:#6ea8fe;">github.com/Crazy8697/PhoneDeck</a>')
+        link.setOpenExternalLinks(True)
+        v.addWidget(link)
+        bb = QDialogButtonBox(QDialogButtonBox.Close)
+        bb.rejected.connect(dlg.reject); bb.accepted.connect(dlg.accept)
+        v.addWidget(bb)
+        dlg.setMinimumWidth(380)
+        dlg.exec()
+
     def device_search(self):
         dlg = QDialog(self)
         dlg.setWindowTitle("Device search")
@@ -1048,33 +1167,62 @@ class PhoneDeck(QMainWindow):
         dlg = QDialog(self)
         dlg.setWindowTitle("Settings")
         form = QFormLayout(dlg)
-        res = QComboBox()
-        res.addItems(["1280x720", "1600x900", "1920x1080"])
-        res.setCurrentText(cfg_get("resolution"))
-        dpi = QSpinBox(); dpi.setRange(120, 480); dpi.setSingleStep(20)
-        dpi.setValue(cfg_get("dpi", int))
+
+        def _res_combo(items, current):
+            c = QComboBox(); c.setEditable(True); c.addItems(items)
+            c.setCurrentText(current); return c
+
+        def _dpi_spin(val):
+            s = QSpinBox(); s.setRange(120, 480); s.setSingleStep(20)
+            s.setValue(val); return s
+
+        ls_res = _res_combo(["1280x720", "1600x900", "1920x1080", "2560x1440"],
+                            cfg_get("res_landscape"))
+        ls_dpi = _dpi_spin(cfg_get("dpi_landscape", int))
+        pt_res = _res_combo(["720x1280", "900x1600", "1080x1920", "1440x2560"],
+                            cfg_get("res_portrait"))
+        pt_dpi = _dpi_spin(cfg_get("dpi_portrait", int))
+        form.addRow(_section("Landscape"))
+        form.addRow("Resolution", ls_res)
+        form.addRow("Density (dpi)", ls_dpi)
+        form.addRow(_section("Portrait"))
+        form.addRow("Resolution", pt_res)
+        form.addRow("Density (dpi)", pt_dpi)
+
         scroll = QSpinBox(); scroll.setRange(60, 800); scroll.setSingleStep(20)
         scroll.setSuffix(" px"); scroll.setValue(cfg_get("scroll_dist", int))
         natural = QCheckBox("Natural (wheel up scrolls up)")
         natural.setChecked(cfg_get("scroll_natural", bool))
-        form.addRow("Resolution", res)
-        form.addRow("Density (dpi)", dpi)
+        data_usage = QCheckBox("Show mobile data usage (for tethering)")
+        data_usage.setChecked(cfg_get("show_data_usage", bool))
+        form.addRow(_section("Other"))
         form.addRow("Scroll distance", scroll)
         form.addRow("", natural)
-        note = QLabel("Resolution/density changes reconnect the display.")
+        form.addRow("", data_usage)
+        note = QLabel("Resolution/density applies to the matching orientation "
+                      "and reconnects the display when it changes.")
         note.setStyleSheet("color:#9aa4b2;")
+        note.setWordWrap(True)
         form.addRow(note)
         bb = QDialogButtonBox(QDialogButtonBox.Save | QDialogButtonBox.Cancel)
         bb.accepted.connect(dlg.accept); bb.rejected.connect(dlg.reject)
         form.addRow(bb)
         if dlg.exec() == QDialog.Accepted:
-            old = (cfg_get("resolution"), cfg_get("dpi", int))
+            portrait = cfg().value("portrait", False, type=bool)
+            old = (cfg_get("res_portrait" if portrait else "res_landscape"),
+                   cfg_get("dpi_portrait" if portrait else "dpi_landscape", int))
             c = cfg()
-            c.setValue("resolution", res.currentText())
-            c.setValue("dpi", dpi.value())
+            c.setValue("res_landscape", ls_res.currentText())
+            c.setValue("dpi_landscape", ls_dpi.value())
+            c.setValue("res_portrait", pt_res.currentText())
+            c.setValue("dpi_portrait", pt_dpi.value())
             c.setValue("scroll_dist", scroll.value())
             c.setValue("scroll_natural", natural.isChecked())
-            if self.target and (res.currentText(), dpi.value()) != old:
+            c.setValue("show_data_usage", data_usage.isChecked())
+            self._sync_data_monitor()
+            new = (cfg_get("res_portrait" if portrait else "res_landscape"),
+                   cfg_get("dpi_portrait" if portrait else "dpi_landscape", int))
+            if self.target and new != old:
                 self.embed.start(self.target)   # restart display at new size
 
     def _connected(self, target):
@@ -1088,6 +1236,8 @@ class PhoneDeck(QMainWindow):
         self.status.showMessage(f"Connected  ({target})")
         self.embed.start(target)
         self.load_apps()
+        self._data_base = None
+        self._sync_data_monitor()
 
     def _display_ready(self, did):
         self.status.showMessage(f"Connected  ({self.target})")
