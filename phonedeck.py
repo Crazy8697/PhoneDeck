@@ -898,6 +898,7 @@ class PhoneDeck(QMainWindow):
         self._data_lbl.setStyleSheet("color:#9aa4b2; padding:0 6px;")
         self.status.addPermanentWidget(self._data_lbl)
         self._data_base = None          # (rx, tx) baseline for this session
+        self._data_last = None          # (rx, tx, monotonic) for rate calc
         self._data_timer = QTimer(self)
         self._data_timer.setInterval(3000)
         self._data_timer.timeout.connect(self._tick_data_usage)
@@ -1076,12 +1077,22 @@ class PhoneDeck(QMainWindow):
         if rx is None:
             self._data_lbl.setText("")
             return
+        now = time.monotonic()
         if self._data_base is None:
             self._data_base = (rx, tx)
-        drx, dtx = rx - self._data_base[0], tx - self._data_base[1]
+        # live rate from the previous sample
+        rate = ""
+        if self._data_last:
+            prx, ptx, pt = self._data_last
+            dt = now - pt
+            if dt > 0:
+                dn, up = max(0, rx - prx) / dt, max(0, tx - ptx) / dt
+                rate = f"  ↓{fmt_bytes(dn)}/s ↑{fmt_bytes(up)}/s"
+        self._data_last = (rx, tx, now)
         teth = "📡 " if tethering_active(self.target) else "📶 "
         self._data_lbl.setText(
-            f"{teth}mobile ↓{fmt_bytes(max(0, drx))} ↑{fmt_bytes(max(0, dtx))}")
+            f"{teth}mobile  ↓{fmt_bytes(max(0, rx - self._data_base[0]))}"
+            f" ↑{fmt_bytes(max(0, tx - self._data_base[1]))}{rate}")
 
     def open_about(self):
         dlg = QDialog(self)
