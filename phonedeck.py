@@ -93,7 +93,8 @@ SETTING_DEFAULTS = {
     "dpi_portrait": 180,
     "scroll_dist": 260,            # px of swipe per wheel tick
     "scroll_natural": True,        # wheel up scrolls content up
-    "show_data_usage": False,      # live mobile-data readout (for tethering)
+    "show_data_usage": False,      # nerd data: live mobile-data readout
+    "show_charge": False,          # nerd data: charge status + watts
 }
 
 
@@ -218,6 +219,28 @@ def fmt_bytes(n):
         if n < 1024 or unit == "TB":
             return f"{n:.0f} {unit}" if unit == "B" else f"{n:.1f} {unit}"
         n /= 1024
+
+
+def charge_info(target):
+    """Battery/charging snapshot: dict(status, level, watts, amps). status is the
+    Android battery status int (2=charging, 5=full). watts is instantaneous power
+    at the battery (|current| x voltage)."""
+    rc, out = run([ADB, "-s", target, "shell", "dumpsys", "battery"], timeout=8)
+    d = {}
+    for line in out.splitlines():
+        m = re.match(r"\s*(status|level|voltage):\s*(-?\d+)\s*$", line)
+        if m:
+            d[m.group(1)] = int(m.group(2))
+    rc, cur = run([ADB, "-s", target, "shell", "cat",
+                   "/sys/class/power_supply/battery/current_now"], timeout=8)
+    try:
+        amps = int(cur.strip()) / 1e6          # µA -> A
+    except ValueError:
+        amps = None
+    volts = d.get("voltage", 0) / 1000.0       # mV -> V
+    watts = abs(amps) * volts if (amps is not None and volts) else None
+    return {"status": d.get("status"), "level": d.get("level"),
+            "watts": watts, "amps": amps}
 
 
 def _section(text):
@@ -894,6 +917,9 @@ class PhoneDeck(QMainWindow):
 
         self.status = self.statusBar()
         self.status.showMessage("Connecting…")
+        self._charge_lbl = QLabel("")
+        self._charge_lbl.setStyleSheet("color:#9aa4b2; padding:0 6px;")
+        self.status.addPermanentWidget(self._charge_lbl)
         self._data_lbl = QLabel("")
         self._data_lbl.setStyleSheet("color:#9aa4b2; padding:0 6px;")
         self.status.addPermanentWidget(self._data_lbl)
@@ -901,7 +927,7 @@ class PhoneDeck(QMainWindow):
         self._data_last = None          # (rx, tx, monotonic) for rate calc
         self._data_timer = QTimer(self)
         self._data_timer.setInterval(3000)
-        self._data_timer.timeout.connect(self._tick_data_usage)
+        self._data_timer.timeout.connect(self._tick_nerd_data)
 
         self._apply_theme()
         self._restore_geometry()
@@ -1057,22 +1083,47 @@ class PhoneDeck(QMainWindow):
              "android.settings.TETHER_SETTINGS"], timeout=10)
         self.status.showMessage("Opened Tethering settings on the phone", 5000)
 
-    # -- mobile data usage readout (for tethering) --
+    # -- nerd-data readouts (mobile data usage + charge) --
     def _sync_data_monitor(self):
-        """Start/stop the data-usage timer to match the setting + connection."""
-        want = cfg_get("show_data_usage", bool) and bool(self.target)
+        """Start/stop the nerd-data timer to match the settings + connection."""
+        want = bool(self.target) and (cfg_get("show_data_usage", bool)
+                                      or cfg_get("show_charge", bool))
         if want and not self._data_timer.isActive():
             self._data_base = None
             self._data_timer.start()
-            self._tick_data_usage()
+            self._tick_nerd_data()
         elif not want and self._data_timer.isActive():
             self._data_timer.stop()
             self._data_lbl.setText("")
+            self._charge_lbl.setText("")
 
-    def _tick_data_usage(self):
+    def _tick_nerd_data(self):
         if not self.target:
-            self._data_lbl.setText("")
+            self._data_lbl.setText(""); self._charge_lbl.setText("")
             return
+        if cfg_get("show_charge", bool):
+            self._update_charge()
+        else:
+            self._charge_lbl.setText("")
+        if cfg_get("show_data_usage", bool):
+            self._update_data_usage()
+        else:
+            self._data_lbl.setText("")
+
+    def _update_charge(self):
+        c = charge_info(self.target)
+        lvl = c["level"]
+        lvl_s = f"{lvl}%" if lvl is not None else "?"
+        if c["status"] == 5:
+            self._charge_lbl.setText(f"⚡ full  {lvl_s}")
+        elif c["status"] == 2 and c["watts"] is not None:
+            self._charge_lbl.setText(f"⚡ {c['watts']:.1f} W  {lvl_s}")
+        elif c["watts"] is not None and c["amps"] is not None and c["amps"] < 0:
+            self._charge_lbl.setText(f"🔋 -{c['watts']:.1f} W  {lvl_s}")
+        else:
+            self._charge_lbl.setText(f"🔋 {lvl_s}")
+
+    def _update_data_usage(self):
         rx, tx = mobile_bytes(self.target)
         if rx is None:
             self._data_lbl.setText("")
@@ -1204,12 +1255,17 @@ class PhoneDeck(QMainWindow):
         scroll.setSuffix(" px"); scroll.setValue(cfg_get("scroll_dist", int))
         natural = QCheckBox("Natural (wheel up scrolls up)")
         natural.setChecked(cfg_get("scroll_natural", bool))
-        data_usage = QCheckBox("Show mobile data usage (for tethering)")
-        data_usage.setChecked(cfg_get("show_data_usage", bool))
         form.addRow(_section("Other"))
         form.addRow("Scroll distance", scroll)
         form.addRow("", natural)
+
+        data_usage = QCheckBox("Show mobile data usage (for tethering)")
+        data_usage.setChecked(cfg_get("show_data_usage", bool))
+        charge = QCheckBox("Show charge rate (watts + battery %)")
+        charge.setChecked(cfg_get("show_charge", bool))
+        form.addRow(_section("Nerd data"))
         form.addRow("", data_usage)
+        form.addRow("", charge)
         note = QLabel("Resolution/density applies to the matching orientation "
                       "and reconnects the display when it changes.")
         note.setStyleSheet("color:#9aa4b2;")
@@ -1230,6 +1286,7 @@ class PhoneDeck(QMainWindow):
             c.setValue("scroll_dist", scroll.value())
             c.setValue("scroll_natural", natural.isChecked())
             c.setValue("show_data_usage", data_usage.isChecked())
+            c.setValue("show_charge", charge.isChecked())
             self._sync_data_monitor()
             new = (cfg_get("res_portrait" if portrait else "res_landscape"),
                    cfg_get("dpi_portrait" if portrait else "dpi_landscape", int))
