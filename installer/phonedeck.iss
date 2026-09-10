@@ -2,7 +2,7 @@
 ; Build:  ISCC.exe installer\phonedeck.iss   (run from the repo root)
 
 #define MyAppName "PhoneDeck"
-#define MyAppVersion "1.1.3"
+#define MyAppVersion "1.2.0"
 #define MyAppPublisher "Adam Dreher"
 #define MyAppExeName "PhoneDeck.exe"
 
