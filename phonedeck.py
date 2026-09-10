@@ -22,14 +22,14 @@ import sys
 import threading
 import time
 
-from PySide6.QtCore import (Qt, QTimer, QThread, Signal, QSettings, QEvent,
+from PySide6.QtCore import (Qt, QTimer, QThread, Signal, QSettings,
                             QPointF, QSize)
 from PySide6.QtGui import (QFont, QColor, QCursor, QIcon, QPixmap, QPainter,
                            QPen, QBrush, QPolygonF)
 from PySide6.QtWidgets import (
     QApplication, QWidget, QMainWindow, QHBoxLayout, QVBoxLayout, QLineEdit,
     QListWidget, QListWidgetItem, QPushButton, QLabel, QFrame, QMenu,
-    QDialog, QComboBox, QSpinBox, QSlider, QCheckBox, QDialogButtonBox,
+    QDialog, QComboBox, QSpinBox, QCheckBox, QDialogButtonBox,
     QFormLayout, QToolButton, QMessageBox,
 )
 
@@ -640,6 +640,75 @@ class PushWorker(QThread):
         self.done.emit(n, self.dest)
 
 
+class Poller(QThread):
+    """One background thread for all periodic adb reads, so the UI thread never
+    blocks on them. Every ~2s it relocates any scrcpy-grabbed drops and (when
+    those readouts are enabled) reads the nerd-data stats, handing results back
+    to the main thread via signals. Inputs (target, display_id, apps, flags) are
+    set from the main thread; simple attribute assignments are atomic enough."""
+    stats = Signal(dict)          # {"batt":..., "data":(rx,tx)|None, "teth":bool}
+    moved = Signal(int, str)      # count, destination folder name
+
+    def __init__(self):
+        super().__init__()
+        self._stop = threading.Event()
+        self.target = None
+        self.display_id = None
+        self.apps = []
+        self.current_app = None
+        self.want_batt = False
+        self.want_data = False
+
+    def stop(self):
+        self._stop.set()
+
+    def run(self):
+        while not self._stop.is_set():
+            t = self.target
+            if t:
+                try:
+                    self._relocate(t)
+                    res = {}
+                    if self.want_batt:
+                        res["batt"] = charge_info(t)
+                    if self.want_data:
+                        res["data"] = mobile_bytes(t)
+                        res["teth"] = tethering_active(t)
+                    if res:
+                        self.stats.emit(res)
+                except Exception:
+                    pass
+            self._stop.wait(2.0)
+
+    def _folder(self, t):
+        pkg = foreground_pkg(t, self.display_id) or self.current_app
+        if not pkg:
+            return "Unknown"
+        label = next((l for l, p in self.apps if p == pkg), pkg)
+        return safe_folder(label)
+
+    def _relocate(self, t):
+        rc, out = run([ADB, "-s", t, "shell", f"ls -1 '{PUSH_STAGE}'"], timeout=8)
+        files = [ln for ln in out.splitlines()
+                 if ln.strip() and "No such file" not in ln]
+        if not files:
+            return
+        dest = f"{APPS_ROOT}/{self._folder(t)}"
+        run([ADB, "-s", t, "shell", f"mkdir -p '{dest}'"])
+        moved = 0
+        for name in files:
+            rc, _ = run([ADB, "-s", t, "shell",
+                         f"mv '{PUSH_STAGE}/{name}' '{dest}/'"], timeout=30)
+            if rc == 0:
+                run([ADB, "-s", t, "shell",
+                     "am broadcast -a "
+                     "android.intent.action.MEDIA_SCANNER_SCAN_FILE "
+                     f"-d 'file://{dest}/{name}'"], timeout=15)
+                moved += 1
+        if moved:
+            self.moved.emit(moved, dest.rsplit("/", 1)[-1])
+
+
 # ---- keyboard bridge ------------------------------------------------------
 class KeyBridge:
     """Forwards PC keystrokes to the phone's virtual display. Each command runs
@@ -1068,12 +1137,10 @@ class PhoneDeck(QMainWindow):
         self._rate_hist = collections.deque(maxlen=40)
         self._data_base = None          # (rx, tx) baseline for this session
         self._data_last = None          # (rx, tx, monotonic) for rate calc
-        self._data_timer = QTimer(self)
-        self._data_timer.setInterval(3000)
-        self._data_timer.timeout.connect(self._tick_nerd_data)
-        self._stage_timer = QTimer(self)       # relocate scrcpy-grabbed drops
-        self._stage_timer.setInterval(2000)
-        self._stage_timer.timeout.connect(self._poll_stage)
+        self.poller = Poller()          # all periodic adb reads, off the UI thread
+        self.poller.stats.connect(self._on_stats)
+        self.poller.moved.connect(self._on_moved)
+        self.poller.start()
 
         self._apply_theme()
         self._restore_geometry()
@@ -1263,48 +1330,45 @@ class PhoneDeck(QMainWindow):
              "android.settings.TETHER_SETTINGS"], timeout=10)
         self.status.showMessage("Opened Tethering settings on the phone", 5000)
 
-    # -- nerd-data readouts (mobile data usage + charge) --
+    # -- nerd-data readouts (driven by the background Poller) --
     def _sync_data_monitor(self):
-        """Start/stop the nerd-data timer to match the settings + connection."""
-        want = bool(self.target) and (cfg_get("show_data_usage", bool)
-                                      or cfg_get("show_charge", bool)
-                                      or cfg_get("show_temp", bool))
-        if want and not self._data_timer.isActive():
-            self._data_base = None
-            self._data_timer.start()
-            self._tick_nerd_data()
-        elif not want and self._data_timer.isActive():
-            self._data_timer.stop()
-            self._clear_nerd_labels()
+        """Point the poller at which stats to read, and clear any now-off labels.
+        The poller thread itself always runs (it also relocates dropped files)."""
+        self.poller.want_batt = (cfg_get("show_charge", bool)
+                                 or cfg_get("show_temp", bool))
+        self.poller.want_data = cfg_get("show_data_usage", bool)
+        if not cfg_get("show_temp", bool):
+            self._temp_lbl.clear()
+        if not cfg_get("show_charge", bool):
+            self._charge_lbl.clear(); self._charge_spark.clear()
+        if not cfg_get("show_data_usage", bool):
+            self._data_lbl.clear(); self._data_spark.clear()
 
     def _clear_nerd_labels(self):
         for w in (self._data_lbl, self._charge_lbl, self._temp_lbl,
                   self._data_spark, self._charge_spark):
             w.clear()
 
-    def _tick_nerd_data(self):
-        if not self.target:
-            self._clear_nerd_labels()
-            return
-        if cfg_get("show_temp", bool):
-            self._update_temp()
-        else:
-            self._temp_lbl.clear()
-        if cfg_get("show_charge", bool):
-            self._update_charge()
-        else:
-            self._charge_lbl.clear(); self._charge_spark.clear()
-        if cfg_get("show_data_usage", bool):
-            self._update_data_usage()
-        else:
-            self._data_lbl.clear(); self._data_spark.clear()
+    def _on_stats(self, res):
+        """Render a batch of readings from the poller (runs on the UI thread)."""
+        c = res.get("batt")
+        if c is not None:
+            if cfg_get("show_temp", bool):
+                self._render_temp(c)
+            if cfg_get("show_charge", bool):
+                self._render_charge(c)
+        if "data" in res and cfg_get("show_data_usage", bool):
+            self._render_data(res["data"], res.get("teth", False))
 
-    def _update_temp(self):
-        t = charge_info(self.target).get("temp_c")
+    def _on_moved(self, n, folder):
+        self.status.showMessage(
+            f"Moved {n} dropped file(s) to Pictures/Apps/{folder}", 5000)
+
+    def _render_temp(self, c):
+        t = c.get("temp_c")
         self._temp_lbl.setText(f"🌡 {t:.1f}°C" if t is not None else "")
 
-    def _update_charge(self):
-        c = charge_info(self.target)
+    def _render_charge(self, c):
         lvl = c["level"]
         lvl_s = f"{lvl}%" if lvl is not None else "?"
         if c["status"] == 5:
@@ -1320,15 +1384,14 @@ class PhoneDeck(QMainWindow):
             self._charge_spark.setPixmap(
                 make_sparkline(list(self._charge_hist), 48, 16, "#e0913a"))
 
-    def _update_data_usage(self):
-        rx, tx = mobile_bytes(self.target)
+    def _render_data(self, data, teth_active):
+        rx, tx = data
         if rx is None:
             self._data_lbl.setText("")
             return
         now = time.monotonic()
         if self._data_base is None:
             self._data_base = (rx, tx)
-        # live rate from the previous sample
         rate = ""
         if self._data_last:
             prx, ptx, pt = self._data_last
@@ -1340,7 +1403,7 @@ class PhoneDeck(QMainWindow):
                 self._data_spark.setPixmap(
                     make_sparkline(list(self._rate_hist), 48, 16, "#3aa8c0"))
         self._data_last = (rx, tx, now)
-        teth = "📡 " if tethering_active(self.target) else "📶 "
+        teth = "📡 " if teth_active else "📶 "
         self._data_lbl.setText(
             f"{teth}mobile  ↓{fmt_bytes(max(0, rx - self._data_base[0]))}"
             f" ↑{fmt_bytes(max(0, tx - self._data_base[1]))}{rate}")
@@ -1551,6 +1614,7 @@ class PhoneDeck(QMainWindow):
 
     def _connected(self, target):
         self.target = target
+        self.poller.target = target
         if not target:
             self.status.showMessage("No device found — pick one, or plug in / "
                                     "enable Wireless debugging then Refresh")
@@ -1562,14 +1626,15 @@ class PhoneDeck(QMainWindow):
         self.embed.start(target)
         self.load_apps()
         self._data_base = None
-        self._sync_data_monitor()
         run([ADB, "-s", target, "shell", f"mkdir -p '{PUSH_STAGE}'"])
-        self._stage_timer.start()
+        self.poller.target = target
+        self._sync_data_monitor()
 
     def _display_ready(self, did):
         self.status.showMessage(f"Connected  ({self.target})")
         self.kb.start(self.target, did)
         self.wheel.install()
+        self.poller.display_id = did
         pend = getattr(self, "_pending_launch", None)
         if pend:
             self._pending_launch = None
@@ -1586,6 +1651,7 @@ class PhoneDeck(QMainWindow):
 
     def _apps_loaded(self, apps):
         self.apps = apps
+        self.poller.apps = apps
         self.filter_apps(self.search.text())
         if self.target:
             self.status.showMessage(f"Connected  ({self.target})")
@@ -1606,6 +1672,20 @@ class PhoneDeck(QMainWindow):
             profs.pop(pkg, None)
         cfg().setValue("app_profiles", json.dumps(profs))
         self.filter_apps(self.search.text())
+
+    def _open_app_info(self, pkg):
+        """Open the phone's App info (settings details) screen for a package,
+        on the virtual display if there is one."""
+        if not self.target:
+            self.status.showMessage("No device connected", 4000)
+            return
+        args = ["am", "start"]
+        if self.embed.display_id is not None:
+            args += ["--display", str(self.embed.display_id)]
+        args += ["-a", "android.settings.APPLICATION_DETAILS_SETTINGS",
+                 "-d", f"package:{pkg}"]
+        run([ADB, "-s", self.target, "shell", *args], timeout=10)
+        self.status.showMessage(f"Opened App info for {self._app_label(pkg)}", 4000)
 
     def _clear_app_images(self, pkg):
         """Delete the files PhoneDeck dropped into this app's folder."""
@@ -1686,6 +1766,7 @@ class PhoneDeck(QMainWindow):
             a.setCheckable(True)
             a.setChecked(prof == val)
         menu.addSeparator()
+        info_act = menu.addAction("App info (on phone)")
         clear_act = menu.addAction("Clear dropped images")
         chosen = menu.exec(self.applist.mapToGlobal(pos))
         if chosen == fav_act:
@@ -1698,6 +1779,8 @@ class PhoneDeck(QMainWindow):
         elif chosen in (a_def, a_land, a_port):
             self._set_profile(pkg, {a_def: None, a_land: "landscape",
                                     a_port: "portrait"}[chosen])
+        elif chosen == info_act:
+            self._open_app_info(pkg)
         elif chosen == clear_act:
             self._clear_app_images(pkg)
 
@@ -1722,6 +1805,7 @@ class PhoneDeck(QMainWindow):
 
     def _launch_now(self, pkg):
         self._current_app = pkg          # fallback for per-app drop folder
+        self.poller.current_app = pkg
         did = self.embed.display_id
         if did is None:
             # display not ready yet — fall back to phone screen
@@ -1777,34 +1861,6 @@ class PhoneDeck(QMainWindow):
         self.status.showMessage(
             f"Pushed {n} file(s) to Pictures/Apps/{folder} — pick them in the app")
 
-    def _poll_stage(self):
-        """Move files scrcpy dropped into the staging dir into the focused
-        app's folder. Safe because only scrcpy writes to PUSH_STAGE."""
-        if not self.target:
-            return
-        rc, out = run([ADB, "-s", self.target, "shell", f"ls -1 '{PUSH_STAGE}'"],
-                      timeout=8)
-        files = [ln for ln in out.splitlines()
-                 if ln.strip() and "No such file" not in ln]
-        if not files:
-            return
-        folder = self._current_folder_name()
-        dest = f"{APPS_ROOT}/{folder}"
-        run([ADB, "-s", self.target, "shell", f"mkdir -p '{dest}'"])
-        moved = 0
-        for name in files:
-            rc, _ = run([ADB, "-s", self.target, "shell",
-                         f"mv '{PUSH_STAGE}/{name}' '{dest}/'"], timeout=30)
-            if rc == 0:
-                run([ADB, "-s", self.target, "shell",
-                     "am broadcast -a "
-                     "android.intent.action.MEDIA_SCANNER_SCAN_FILE "
-                     f"-d 'file://{dest}/{name}'"], timeout=15)
-                moved += 1
-        if moved:
-            self.status.showMessage(
-                f"Moved {moved} dropped file(s) to Pictures/Apps/{folder}", 5000)
-
     # -- nav --
     def nav(self, name):
         if not self.target:
@@ -1820,7 +1876,8 @@ class PhoneDeck(QMainWindow):
     def closeEvent(self, e):
         QSettings("PhoneDeck", "PhoneDeck").setValue("geometry",
                                                      self.saveGeometry())
-        self._stage_timer.stop()
+        self.poller.stop()
+        self.poller.wait(2000)
         self.wheel.remove()
         self.kb.stop()
         self.embed.stop()
