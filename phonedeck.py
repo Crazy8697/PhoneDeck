@@ -87,7 +87,7 @@ _SCRCPY_VDISP_RE = re.compile(
 CREATE_NO_WINDOW = 0x08000000      # keep adb/scrcpy console windows hidden
 
 # user settings (persisted via QSettings), with defaults
-VERSION = "1.2.0"
+VERSION = "1.3.0"
 
 SETTING_DEFAULTS = {
     "res_landscape": "1920x1080",  # virtual display W x H, landscape
