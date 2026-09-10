@@ -860,16 +860,25 @@ class ScrcpyEmbed(QWidget):
         win32gui.SetWindowLong(hwnd, win32con.GWL_STYLE, style)
         win32gui.SetParent(hwnd, int(self.winId()))
         self._fit()
+        self._revoke_drop()
         # The first fit can land relative to a stale origin (the reparent
         # hasn't fully settled the instant the window appears), leaving the
         # child parked off-screen. Re-fit after layout settles so it can't
-        # stick there.
-        for ms in (150, 500, 1500):
+        # stick there. scrcpy also registers its OWN file-drop target during
+        # video init — slightly AFTER the window appears — so re-revoke over
+        # the same window; otherwise drops land in /sdcard/Download via scrcpy
+        # instead of bubbling to PhoneDeck's per-app-folder handler.
+        for ms in (150, 500, 1500, 3000):
             QTimer.singleShot(ms, self._fit)
-        try:   # drop scrcpy's own file-drop target so drops bubble to Qt
+            QTimer.singleShot(ms, self._revoke_drop)
+
+    def _revoke_drop(self):
+        if not self.hwnd:
+            return
+        try:
             ole = ctypes.windll.ole32
             ole.RevokeDragDrop.argtypes = [ctypes.c_void_p]
-            ole.RevokeDragDrop(hwnd)
+            ole.RevokeDragDrop(self.hwnd)
         except Exception:
             pass
 
