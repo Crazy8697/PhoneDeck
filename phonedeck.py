@@ -261,23 +261,29 @@ def kill_orphan_embeds():
 
 def list_devices():
     """Connectable devices: currently-connected adb devices + wireless-debugging
-    devices found via mDNS. Returns [(label, target)]."""
+    devices found via mDNS. Returns [(label, target)]. Labels lead with the
+    device name (model) so devices are recognizable when IPs aren't static."""
     devices, seen = [], set()
-    rc, o = run([ADB, "devices"])
+    rc, o = run([ADB, "devices", "-l"])
     for line in o.splitlines():
-        m = re.match(r"^(\S+)\s+device$", line)
+        m = re.match(r"^(\S+)\s+device\b(.*)$", line)
         if m and m.group(1) != "List":
-            t = m.group(1)
+            t, rest = m.group(1), m.group(2)
             seen.add(t)
             kind = "wireless" if re.match(r"\d+\.\d+\.\d+\.\d+:", t) else "USB"
-            devices.append((f"{t}   ({kind}, connected)", t))
+            nm = re.search(r"\bmodel:(\S+)", rest) or re.search(r"\bproduct:(\S+)", rest)
+            name = nm.group(1).replace("_", " ") if nm else t
+            devices.append((f"{name}   —   {t}   ({kind}, connected)", t))
     rc, o = run([ADB, "mdns", "services"], timeout=8)
     for line in o.splitlines():
         if _adb_mdns(line):
             m = re.search(r"(\d{1,3}(?:\.\d{1,3}){3}:\d+)", line)
             if m and m.group(1) not in seen:
                 seen.add(m.group(1))
-                devices.append((f"{m.group(1)}   (wireless)", m.group(1)))
+                mdns_name = line.split("\t", 1)[0].strip() if "\t" in line else ""
+                label = (f"{mdns_name}   —   {m.group(1)}   (wireless)"
+                         if mdns_name else f"{m.group(1)}   (wireless)")
+                devices.append((label, m.group(1)))
     return devices
 
 
