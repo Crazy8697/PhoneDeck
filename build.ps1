@@ -15,7 +15,8 @@
 #                                don't exist yet and tools\privacy_check.py finds nothing in the tree; then builds the
 #                                Setup and runs the privacy check again on the frozen build (dist\PhoneDeck), refusing
 #                                on any finding. Then:
-#                                  1. -PublicSync: one new public commit "PhoneDeck x.y.z", plain push,
+#                                  1. -PublicSync: one new public commit "PhoneDeck x.y.z", plain push; the public
+#                                     README's download info line gets x.y.z and the built installer's size,
 #                                  2. release vx.y.z on Crazy8697/PhoneDeck on that commit (draft, assets uploaded in
 #                                     this order: PhoneDeck-Setup-x.y.z.exe, its .sha256, PhoneDeck-Setup.exe; then
 #                                     published as latest, body from the release notes),
@@ -53,7 +54,7 @@ $PublicName = "Crazy8697"
 $PublicEmail = "261646346+Crazy8697@users.noreply.github.com"
 
 # ---- the public source sync: one commit on the public history, from exactly the committed tree ----
-function Sync-Public([string]$ver, [string]$py, [switch]$Fresh, [switch]$NoPush) {
+function Sync-Public([string]$ver, [string]$py, [switch]$Fresh, [switch]$NoPush, [string]$Installer = "") {
     $dirty = git -C $PSScriptRoot status --porcelain
     if ($LASTEXITCODE -ne 0) { throw "git status failed" }
     if ($dirty) { throw "The PhoneDeck tree isn't clean in git; commit (to Forgejo) first." }
@@ -80,8 +81,25 @@ function Sync-Public([string]$ver, [string]$py, [switch]$Fresh, [switch]$NoPush)
         }
         # replace the clone's files with exactly the exported tree
         git -C $PublicDir rm -r -q -f --ignore-unmatch -- . | Out-Null
+        # the README's download info line lives only in the public README: a release writes it from the
+        # real installer (version + size); a plain sync carries the published one forward
+        $oldReadme = Join-Path $stage "..\$(Split-Path $stage -Leaf)-README.md"
+        $pubReadme = Join-Path $PublicDir "README.md"
+        if (Test-Path $pubReadme) { Copy-Item $pubReadme $oldReadme -Force }
         Get-ChildItem $PublicDir -Force | Where-Object { $_.Name -ne ".git" } | Remove-Item -Recurse -Force
         Copy-Item (Join-Path $stage "*") $PublicDir -Recurse -Force
+        $export = Join-Path $PSScriptRoot "tools\public_export.py"
+        if ($Installer) {
+            & $py $export --dl-info $pubReadme $ver $Installer
+            if ($LASTEXITCODE -ne 0) { throw "Couldn't write the README download info." }
+        } elseif (Test-Path $oldReadme) {
+            & $py $export --keep-dl-info $pubReadme $oldReadme
+            if ($LASTEXITCODE -ne 0) { throw "Couldn't carry the README download info over." }
+        }
+        if (Test-Path $oldReadme) { Remove-Item $oldReadme -Force }
+        # the tree that is about to be committed, checked once more as it stands
+        & $py (Join-Path $PSScriptRoot "tools\privacy_check.py") --root $PublicDir
+        if ($LASTEXITCODE -ne 0) { throw "The privacy check found something in the public clone; nothing was published." }
         git -C $PublicDir add -A
         $changes = git -C $PublicDir status --porcelain
         if (-not $changes) {
@@ -189,7 +207,7 @@ try {
 
         # 1. the public source: one new commit "PhoneDeck <ver>" on the public history (plain push)
         $script:PublicCommit = $null
-        Sync-Public $ver $py
+        Sync-Public $ver $py -Installer $out
         if (-not $script:PublicCommit) { throw "The public sync didn't report its commit; nothing was released." }
 
         # 2. the release, on that commit. Created as a draft so the assets go up one at a time in a fixed

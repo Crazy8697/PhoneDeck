@@ -16,7 +16,7 @@ Free, local, built on scrcpy. Your phone's own screen stays free.</p>
 </p>
 
 <!-- dl-info -->
-<p align="center"><sub>Windows 10 / 11, 64-bit &nbsp;&middot;&nbsp; <a href="https://github.com/Crazy8697/PhoneDeck/releases">all releases</a></sub></p>
+<p align="center"><sub>Version 1.5.1 &nbsp;&middot;&nbsp; 28.8 MB &nbsp;&middot;&nbsp; Windows 10 / 11, 64-bit &nbsp;&middot;&nbsp; <a href="https://github.com/Crazy8697/PhoneDeck/releases">all releases</a></sub></p>
 <!-- /dl-info -->
 
 <p align="center"><sub>The installer isn't code-signed, so Windows may show "Windows protected your PC": click <b>More info</b>, then <b>Run anyway</b>.</sub></p>
