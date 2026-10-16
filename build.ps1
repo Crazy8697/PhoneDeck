@@ -10,11 +10,17 @@
 #                                SVGs in assets\icon (make_icon.py; needs Inkscape), then build as usual
 #   .\build.ps1 -PrivacyCheck    run tools\privacy_check.py on the tree (and on dist\PhoneDeck if built), nothing else
 #   .\build.ps1 -Release -Version x.y.z
-#                                the release gate (publishing itself comes in Stages 9 and 10, the Lazarus PDF way):
-#                                refuses unless the tree is clean in git, x.y.z is phonedeck.VERSION and
-#                                tools\privacy_check.py finds nothing in the tree; then builds the Setup and runs
-#                                the privacy check again on the frozen build (dist\PhoneDeck), refusing on any finding.
-#                                Then stops: the GitHub release (Stage 10) and winget (Stage 13) slot in after it.
+#                                publish, the Lazarus PDF way. Refuses unless the tree is clean in git, x.y.z is
+#                                phonedeck.VERSION, installer\release-notes\vx.y.z.md exists, the release and the tag
+#                                don't exist yet and tools\privacy_check.py finds nothing in the tree; then builds the
+#                                Setup and runs the privacy check again on the frozen build (dist\PhoneDeck), refusing
+#                                on any finding. Then:
+#                                  1. -PublicSync: one new public commit "PhoneDeck x.y.z", plain push,
+#                                  2. release vx.y.z on Crazy8697/PhoneDeck on that commit (draft, assets uploaded in
+#                                     this order: PhoneDeck-Setup-x.y.z.exe, its .sha256, PhoneDeck-Setup.exe; then
+#                                     published as latest, body from the release notes),
+#                                  3. tag vx.y.z on the private commit, pushed to Forgejo only.
+#                                winget (Stage 13) slots in after it.
 #   .\build.ps1 -PublicSync [-FreshPublicHistory] [-NoPush] [-PublicDir <folder>]
 #                                the public source path (the only route to GitHub): refuses unless the tree is clean
 #                                in git; exports exactly the committed tree at HEAD (tools\public_export.py: git
@@ -78,12 +84,17 @@ function Sync-Public([string]$ver, [string]$py, [switch]$Fresh, [switch]$NoPush)
         Copy-Item (Join-Path $stage "*") $PublicDir -Recurse -Force
         git -C $PublicDir add -A
         $changes = git -C $PublicDir status --porcelain
-        if (-not $changes) { Write-Host "Public source: nothing changed since the last sync."; return }
+        if (-not $changes) {
+            $script:PublicCommit = (git -C $PublicDir rev-parse HEAD).Trim()
+            Write-Host "Public source: nothing changed since the last sync ($script:PublicCommit)."
+            return
+        }
         # (the private history's hashes stay private: the message names the version only)
         $msg = "PhoneDeck $ver"
         git -C $PublicDir -c "user.name=$PublicName" -c "user.email=$PublicEmail" commit -q -m $msg
         if ($LASTEXITCODE -ne 0) { throw "Couldn't commit in the public clone" }
         $commit = (git -C $PublicDir rev-parse HEAD).Trim()
+        $script:PublicCommit = $commit
         if ($NoPush) { Write-Host "Public source committed locally (not pushed): $commit in $PublicDir"; return }
         git -C $PublicDir push -q -u origin main
         if ($LASTEXITCODE -ne 0) { throw "Couldn't push the public source" }
@@ -123,6 +134,12 @@ try {
         & $py $privacy
         if ($LASTEXITCODE -ne 0) { throw "The privacy check found something in the tree; nothing was built or published." }
         if ($NoBuild) { throw "-Release always builds fresh." }
+        $notes = Join-Path $PSScriptRoot "installer\release-notes\v$ver.md"
+        if (-not (Test-Path $notes)) { throw "No release notes: $notes" }
+        # (through cmd: PowerShell 5.1 turns a redirected native stderr into an error under "Stop")
+        cmd /c "gh release view v$ver --repo $PublicRepo >nul 2>&1"
+        if ($LASTEXITCODE -eq 0) { throw "Release v$ver already exists on $PublicRepo." }
+        if (git -C $PSScriptRoot tag --list "v$ver") { throw "Tag v$ver already exists in the private repo." }
         $Setup = $true
     }
 
@@ -168,6 +185,37 @@ try {
     if ($Release) {
         & $py $privacy --dist
         if ($LASTEXITCODE -ne 0) { throw "The privacy check found something in the build; nothing was published." }
-        Write-Host "Release gate passed for $ver. Next: .\build.ps1 -PublicSync for the source; the GitHub release step arrives in Stage 10."
+        Write-Host "Release gate passed for $ver."
+
+        # 1. the public source: one new commit "PhoneDeck <ver>" on the public history (plain push)
+        $script:PublicCommit = $null
+        Sync-Public $ver $py
+        if (-not $script:PublicCommit) { throw "The public sync didn't report its commit; nothing was released." }
+
+        # 2. the release, on that commit. Created as a draft so the assets go up one at a time in a fixed
+        #    order (the 1.4.0 updater takes the FIRST .exe: the versioned installer must be first; the new
+        #    updater wants its .sha256), then published as the latest release in one step, so no one ever
+        #    sees a published release without its checksum.
+        $plain = Join-Path $SetupDir "PhoneDeck-Setup.exe"
+        $assets = @($out, "$out.sha256", $plain)
+        gh release create "v$ver" $assets[0] --repo $PublicRepo --target $script:PublicCommit `
+            --title "PhoneDeck $ver" --notes-file $notes --draft
+        if ($LASTEXITCODE -ne 0) { throw "gh release create failed ($LASTEXITCODE)" }
+        foreach ($a in $assets[1..2]) {
+            gh release upload "v$ver" $a --repo $PublicRepo
+            if ($LASTEXITCODE -ne 0) { throw "Uploading $a failed; the release is still a draft on $PublicRepo." }
+        }
+        $names = (gh release view "v$ver" --repo $PublicRepo --json assets --jq ".assets[].name") -join ","
+        $want = (($assets | ForEach-Object { Split-Path $_ -Leaf }) -join ",")
+        if ($names -ne $want) { throw "Asset order is '$names', not '$want'; the release is still a draft." }
+        gh release edit "v$ver" --repo $PublicRepo --draft=false --latest
+        if ($LASTEXITCODE -ne 0) { throw "Publishing the draft failed; it is still a draft on $PublicRepo." }
+        Write-Host "Released v$ver on $PublicRepo (public commit $script:PublicCommit), assets: $names"
+
+        # 3. the same tag on the private commit, to Forgejo only
+        git -C $PSScriptRoot tag "v$ver"
+        git -C $PSScriptRoot push -q origin "refs/tags/v$ver"
+        if ($LASTEXITCODE -ne 0) { throw "Pushing tag v$ver to Forgejo failed (the GitHub release is out)." }
+        Write-Host "Tagged v$ver on the private commit and pushed the tag to Forgejo."
     }
 } finally { Pop-Location }
