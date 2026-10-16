@@ -1,0 +1,12 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="120" height="120" viewBox="0 0 120 120">
+  <title>PhoneDeck icon, 16 px layer</title>
+  <rect width="120" height="120" rx="20.62" fill="#0a0e14"/>
+  <g transform="translate(-21.54,-12.70) scale(1.159)">
+    <g transform="translate(64,60) rotate(-25) scale(0.78) translate(-60,-55)">
+      <rect x="44" y="8" width="32" height="64" rx="7" fill="#0f2530" stroke="#19C2E6" stroke-width="8.3"/>
+      <path d="M20 84 L100 84 Q104 84 106 79" fill="none" stroke="#19C2E6" stroke-width="8.3" stroke-linecap="round"/>
+      <circle cx="36" cy="99" r="9" fill="#19C2E6"/>
+      <circle cx="84" cy="99" r="9" fill="#19C2E6"/>
+    </g>
+  </g>
+</svg>

@@ -1,0 +1,3 @@
+PySide6-Essentials==6.11.2
+shiboken6==6.11.2
+pywin32==312

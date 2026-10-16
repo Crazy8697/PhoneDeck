@@ -1,0 +1,19 @@
+__pycache__/
+*.pyc
+*.log
+
+favorites.json
+
+# build artifacts
+build/
+dist/
+*.spec
+!phonedeck.spec
+installer/*.exe
+*.sha256
+
+# local build venv
+.venv/
+
+# exact private values for tools/privacy_check.py, never committed
+tools/privacy-local.txt

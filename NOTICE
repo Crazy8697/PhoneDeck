@@ -1,0 +1,13 @@
+PhoneDeck
+Copyright 2026 DarkRelay
+
+This product is licensed under the Apache License, Version 2.0 (see LICENSE).
+
+The Windows build of PhoneDeck includes third-party components, each under its own
+license. They are listed in THIRD-PARTY-NOTICES.md, and their license texts are in
+the licenses folder next to the program.
+
+It includes adb, AdbWinApi.dll and AdbWinUsbApi.dll from the Android Open Source
+Project:
+   Copyright (c) 2006-2009, The Android Open Source Project
+   Licensed under the Apache License, Version 2.0.
